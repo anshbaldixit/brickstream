@@ -42,8 +42,10 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 const CHUNK_BYTES: usize = 4 << 20;
 /// Event chunks are larger: each chunk is one slice of every P1 partition, so fewer chunks mean
-/// fewer, longer slices for dedup.
-const EVENT_CHUNK_BYTES: usize = 16 << 20;
+/// fewer, longer slices for dedup (at 60M events, 64 MB chunks cost ~6% fewer cycles than 16 MB).
+/// About 8 chunks per thread keep the threads evenly loaded; within these bounds.
+const EVENT_CHUNK_MIN: usize = 16 << 20;
+const EVENT_CHUNK_MAX: usize = 64 << 20;
 
 struct Config {
     data: PathBuf,
@@ -124,7 +126,8 @@ fn run(cfg: Config) {
     let open_all = |dir: &str| -> Vec<Input> { list_csv(&cfg.data.join(dir)).par_iter().map(|p| open(p)).collect() };
     let (ev_files, (cl_files, ln_files)) =
         rayon::join(|| open_all("events"), || rayon::join(|| open_all("clicks"), || open_all("links")));
-    let ev_chunks = chunks(&ev_files, 0, tune("EV_CHUNK_KB", EVENT_CHUNK_BYTES >> 10) << 10);
+    let ev_target = (total_bytes(&ev_files) / (8 * threads)).clamp(EVENT_CHUNK_MIN, EVENT_CHUNK_MAX);
+    let ev_chunks = chunks(&ev_files, 0, tune("EV_CHUNK_KB", ev_target >> 10) << 10);
     let cl_chunks = chunks(&cl_files, 0, CHUNK_BYTES);
     let ln_chunks = chunks(&ln_files, 0, CHUNK_BYTES);
     let ev_bytes = total_bytes(&ev_files);

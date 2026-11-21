@@ -27,13 +27,13 @@ use std::time::Instant;
 use mimalloc::MiMalloc;
 use rayon::prelude::*;
 
-use crate::clicks::{ClickParser, ClickRec};
-use crate::dedup::{ClChunk, DedupStats, P2Part};
-use crate::events::{EvChunk, EvRec, EventParser, ParseStats};
+use crate::clicks::ClickParser;
+use crate::dedup::{ClChunk, DedupStats, PRec};
+use crate::events::{EvChunk, EventParser, ParseStats};
 use crate::input::{chunks, list_csv, open, total_bytes, Input};
 use crate::lookups::{read_manifest, Campaigns, Products};
 use crate::output::CampaignRow;
-use crate::sessions::{Acc, Big, Ctx, Row};
+use crate::sessions::{Acc, Big, Ctx, EvSrc, Row};
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -128,8 +128,7 @@ fn run(cfg: Config) {
             .collect();
         let lines: usize = all.par_iter().map(|&(d, s, e)| memchr::memchr_iter(b'\n', &d[s..e]).count()).sum();
         stage!("touch", t, "lines" = lines);
-        stage!("total", t_start);
-        std::process::exit(0);
+        finish(t_start);
     }
 
     // Phase 1: links (table + union-find) alongside every event and click chunk.
@@ -157,26 +156,27 @@ fn run(cfg: Config) {
             n
         }).sum();
         stage!(cfg.mode.as_str(), t, "n" = n);
-        stage!("total", t_start);
-        std::process::exit(0);
+        finish(t_start);
     }
     // Links first, with every thread (union-find is parallel), so the table is ready for phase 2.
     let (link_table, link_stats) = links::build(&ln_files, &ln_chunks);
+    // Timing experiment only (wrong output): lookups against an empty, cache-resident table.
+    let link_table = if tune("NOLINK", 0) == 1 { links::LinkTable::empty() } else { link_table };
     stage!("links", t, "lines" = link_stats.parse.lines.lines, "malformed" = link_stats.parse.lines.malformed,
         "edges" = link_stats.edges, "ids" = link_table.ids, "persons" = link_table.persons,
         "parse_ms" = format!("{:.1}", link_stats.ms_parse), "insert_ms" = format!("{:.1}", link_stats.ms_insert),
-        "union_ms" = format!("{:.1}", link_stats.ms_union), "names_ms" = format!("{:.1}", link_stats.ms_names));
+        "union_ms" = format!("{:.1}", link_stats.ms_union), "names_ms" = format!("{:.1}", link_stats.ms_names), "compact_ms" = format!("{:.1}", link_stats.ms_compact));
     let (ev_stats, ev_out, cl_out) = {
         let t = Instant::now();
-        let parsed: Vec<(EvChunk, ParseStats)> = ev_chunks
+        let parsed: Vec<(EvChunk, Vec<PRec>, ParseStats)> = ev_chunks
             .par_iter()
-            .map(|c| events::parse_chunk(&ev_parser, &link_table, &ev_files[c.file as usize].data, c.start, c.end, p1, shift1))
+            .map(|c| events::parse_chunk(&ev_parser, &link_table, &ev_files[c.file as usize].data, c.start, c.end, p1, shift1, p2, shift2))
             .collect();
         let mut ev_stats = ParseStats::default();
-        for (_, st) in &parsed {
+        for (_, _, st) in &parsed {
             ev_stats.add(*st);
         }
-        let ev_out: Vec<EvChunk> = parsed.into_iter().map(|(c, _)| c).collect();
+        let (ev_out, ev_events): (Vec<EvChunk>, Vec<Vec<PRec>>) = parsed.into_iter().map(|(c, e, _)| (c, e)).unzip();
         stage!("events_parse", t, "lines" = ev_stats.lines.lines, "malformed" = ev_stats.lines.malformed,
             "empty_id" = ev_stats.empty_id, "records" = ev_stats.records, "valid_lines" = ev_stats.valid, "p1" = p1);
         let t = Instant::now();
@@ -191,40 +191,45 @@ fn run(cfg: Config) {
         stage!("clicks_parse", t, "lines" = st.lines.lines, "malformed" = st.lines.malformed,
             "empty_id" = st.empty_id, "valid" = st.valid);
         let cl_out: Vec<ClChunk> = cl.into_iter().map(|(c, _)| c).collect();
-        (ev_stats, ev_out, cl_out)
+        (ev_stats, (ev_out, ev_events), cl_out)
     };
+    let (ev_out, mut ev_events) = ev_out;
     stage!("phase1", t);
     if cfg.mode == "parse" {
-        stage!("total", t_start);
-        std::process::exit(0);
+        finish(t_start);
     }
 
-    // Phase 2: dedup per event_id partition, move survivors to person partitions.
+    // Phase 2: dedup per event_id partition, marking the losers' PRecs in place.
     let t = Instant::now();
     let est_ev = ev_stats.valid as usize + 1;
     let gsize = (p1 / tune("GROUPS", 256)).max(1);
-    let deduped: Vec<(P2Part, DedupStats)> = (0..p1 / gsize)
+    let marks = dedup::Marks::new(&mut ev_events);
+    let dstats = (0..p1 / gsize)
         .into_par_iter()
-        .map(|g| dedup::group(g, g * gsize..(g + 1) * gsize, &ev_out, p2, shift2))
-        .collect();
-    let mut dstats = DedupStats::default();
-    for (_, d) in &deduped {
-        dstats.add(*d);
-    }
-    let parts: Vec<P2Part> = deduped.into_iter().map(|(p, _)| p).collect();
+        .map(|g| dedup::group(g * gsize..(g + 1) * gsize, &ev_out, &marks))
+        .reduce(DedupStats::default, |mut a, b| {
+            a.add(b);
+            a
+        });
+    drop(marks);
     stage!("dedup", t, "records" = dstats.records, "losers" = dstats.losers, "kept_invalid" = dstats.kept_invalid,
-        "survivors" = dstats.survivors, "purchases" = dstats.purchases, "p2" = p2,
-        "cpu_insert_ms" = dstats.ns_insert / 1_000_000, "cpu_scatter_ms" = dstats.ns_scatter / 1_000_000);
-    std::mem::forget(ev_out);
+        "survivors" = dstats.survivors, "p2" = p2, "cpu_ms" = dstats.ns / 1_000_000);
     let cl_parts = cl_out;
+    // Every chunk's purchases in one table; a chunk's PRec::pay is offset by where its part starts.
+    let mut purchases: Vec<(u32, u32)> = Vec::new();
+    let mut ev_src: Vec<EvSrc> = Vec::with_capacity(ev_out.len());
+    for (c, recs) in ev_out.iter().zip(ev_events.iter()) {
+        ev_src.push(EvSrc { recs, offs: &c.eoffs, pbase: purchases.len() as u32 });
+        purchases.extend_from_slice(&c.purchases);
+    }
 
     // Phase 3: sessionize, credit and assist per person; largest partitions first.
     let t = Instant::now();
     let days = window.days();
     let n_camp = campaigns.len();
-    let ctx = Ctx { window, parts: &parts, clicks: &cl_parts, campaigns: n_camp, categories: products.categories.len(), days };
+    let ctx = Ctx { window, events: &ev_src, purchases: &purchases, clicks: &cl_parts, campaigns: n_camp, categories: products.categories.len(), days };
     let mut order: Vec<(usize, usize)> = (0..p2)
-        .map(|q| (parts.iter().map(|pp| pp.part(q).len()).sum::<usize>() + cl_parts.iter().map(|c| c.part(q).len()).sum::<usize>(), q))
+        .map(|q| (ev_src.iter().map(|e| (e.offs[q + 1] - e.offs[q]) as usize).sum::<usize>() + cl_parts.iter().map(|c| c.part(q).len()).sum::<usize>(), q))
         .collect();
     order.sort_unstable_by(|a, b| b.cmp(a));
     let next = AtomicUsize::new(0);
@@ -331,7 +336,17 @@ fn run(cfg: Config) {
         || output::write_campaign_daily(&cd.join("part-00000.parquet"), &camp_rows),
     );
     stage!("write", t, "user_daily_rows" = user_rows, "campaign_daily_rows" = camp_rows.len());
+    finish(t_start);
+}
+
+/// Logs the totals and exits at once, without dropping anything (the kernel reclaims it all).
+/// `_exit` also skips at-exit handlers: the allocator's would walk and release every heap page
+/// first, on one thread. Every output file is complete by now (`fs::write` returns after its
+/// last write), and stderr is unbuffered.
+fn finish(t_start: Instant) -> ! {
     let (cpu_ms, rss_mb) = usage();
-    stage!("total", t_start, "cpu_ms" = cpu_ms, "maxrss_mb" = rss_mb);
-    std::process::exit(0);
+    let end_us = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_micros());
+    stage!("total", t_start, "cpu_ms" = cpu_ms, "maxrss_mb" = rss_mb, "end_us" = end_us);
+    // SAFETY: _exit only ends the process.
+    unsafe { libc::_exit(0) }
 }

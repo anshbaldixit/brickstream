@@ -11,7 +11,7 @@ use std::cell::RefCell;
 use std::time::Instant;
 
 use crate::clicks::ClickRec;
-use crate::dedup::{ClChunk, P2Part, PRec, SIDE_BITS};
+use crate::dedup::{ClChunk, PRec, DROPPED};
 use crate::key::{cmp_ids, mix};
 use crate::lookups::{Window, SEVEN_DAYS_MS};
 use crate::ts::MS_PER_DAY;
@@ -81,9 +81,19 @@ thread_local! {
     static SCRATCH: RefCell<Scratch> = RefCell::new(Scratch::default());
 }
 
+/// One chunk's events, counting-sorted by P2 partition (`offs`), and where its purchases start in
+/// `Ctx::purchases`.
+pub struct EvSrc<'a> {
+    pub recs: &'a [PRec],
+    pub offs: &'a [u32],
+    pub pbase: u32,
+}
+
 pub struct Ctx<'a> {
     pub window: Window,
-    pub parts: &'a [P2Part],
+    pub events: &'a [EvSrc<'a>],
+    /// (price, category rank) of every chunk's purchases, chunk after chunk.
+    pub purchases: &'a [(u32, u32)],
     pub clicks: &'a [ClChunk],
     pub campaigns: usize,
     pub categories: usize,
@@ -93,8 +103,7 @@ pub struct Ctx<'a> {
 impl Ctx<'_> {
     #[inline(always)]
     fn purchase(&self, pay: u32) -> (u32, u32) {
-        let v = pay - 1;
-        self.parts[(v >> SIDE_BITS) as usize].purchases[(v & ((1 << SIDE_BITS) - 1)) as usize]
+        self.purchases[pay as usize - 1]
     }
 }
 
@@ -103,9 +112,15 @@ impl Ctx<'_> {
 /// `assisted` is kept apart from `acc`: assists are the most frequent update (often more than ten per
 /// session), and a compact u32 array stays in L2.
 pub fn partition(ctx: &Ctx, q: usize, rows: &mut Vec<Row>, acc: &mut [Acc], assisted: &mut [u32], big: &mut Vec<Big>) -> u64 {
-    let ev_slices: Vec<&[PRec]> = ctx.parts.iter().map(|pp| pp.part(q)).filter(|s| !s.is_empty()).collect();
+    let ev_slices: Vec<(&[PRec], u32)> = ctx
+        .events
+        .iter()
+        .map(|e| (&e.recs[e.offs[q] as usize..e.offs[q + 1] as usize], e.pbase))
+        .filter(|(s, _)| !s.is_empty())
+        .collect();
     let cl_slices: Vec<&[ClickRec]> = ctx.clicks.iter().map(|c| c.part(q)).filter(|s| !s.is_empty()).collect();
-    let n: usize = ev_slices.iter().map(|s| s.len()).sum();
+    // An upper bound: dedup has dropped some.
+    let n: usize = ev_slices.iter().map(|(s, _)| s.len()).sum();
     if n == 0 {
         return 0;
     }
@@ -127,8 +142,11 @@ pub fn partition(ctx: &Ctx, q: usize, rows: &mut Vec<Row>, acc: &mut [Acc], assi
         sc.of_event.reserve(n);
         sc.tsp.clear();
         sc.tsp.reserve(n);
-        for s in &ev_slices {
+        for &(s, pbase) in &ev_slices {
             for r in s.iter() {
+                if r.ts == DROPPED {
+                    continue;
+                }
                 let mut h = mix(r.person) as usize & mask;
                 let idx = loop {
                     let k = sc.keys[h];
@@ -162,9 +180,11 @@ pub fn partition(ctx: &Ctx, q: usize, rows: &mut Vec<Row>, acc: &mut [Acc], assi
                 };
                 sc.counts[idx as usize] += 1;
                 sc.of_event.push(idx);
-                sc.tsp.push(((r.ts as u64) << 32) | r.pay as u64);
+                let pay = if r.pay != 0 { r.pay + pbase } else { 0 };
+                sc.tsp.push(((r.ts as u64) << 32) | pay as u64);
             }
         }
+        let n = sc.tsp.len();
         let m = sc.persons.len();
         // 2. Clicks of persons who have events (others can't matter).
         sc.ccounts.clear();

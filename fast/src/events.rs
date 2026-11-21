@@ -1,10 +1,12 @@
 //! Events (rules.md "Events, in this order").
 //!
-//! Phase 1 parses every line into an `EvRec` and drops it into a partition by `hash(event_id)`.
-//! Every well-formed line with a non-empty `event_id` enters dedup, valid or not; whether it is valid
-//! (step 3) and not late (step 4) is decided here, per line, and only matters if this copy is the one
-//! dedup keeps. Phase 2 (dedup + resolve) lives below.
+//! Phase 1 parses every line into an `EvRec`, then writes it as two streams: an `EvCopy` (event_id,
+//! ingest time) into a partition by `hash(event_id)`, and, if the line is valid and in time, a
+//! `PRec` (person, ts, purchase) into a partition by `hash(person)`. Every well-formed line with a
+//! non-empty `event_id` enters dedup, valid or not; whether it is valid (step 3) and not late
+//! (step 4) is decided here, per line, and only matters if this copy is the one dedup keeps.
 
+use crate::dedup::PRec;
 use crate::key::{key_of, mix};
 use crate::links::{LinkTable, AHEAD};
 use crate::lookups::{Products, Window};
@@ -164,78 +166,145 @@ impl ParseStats {
     }
 }
 
-/// One chunk's records, counting-sorted by P1 partition: partition `p` is `recs[offs[p]..offs[p + 1]]`.
+/// One copy of an event, in its `event_id` partition (16 bytes): all that dedup needs.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct EvCopy {
+    pub eid: u64,
+    /// `(ingest_seconds + 2^39) << 24 | at`: `at` is the index of this copy's `PRec` in its chunk's
+    /// `events`, or `NO_EVENT` if the copy is invalid or late (it can still win dedup).
+    pub ing_at: u64,
+}
+
+pub const NO_EVENT: u64 = (1 << 24) - 1;
+
+impl EvCopy {
+    #[inline(always)]
+    pub fn ingest(&self) -> u64 {
+        self.ing_at >> 24
+    }
+    #[inline(always)]
+    pub fn at(&self) -> u64 {
+        self.ing_at & NO_EVENT
+    }
+}
+
+/// One chunk, as two counting-sorted streams. `copies`: every copy with an `event_id`, by P1
+/// partition (`hash(event_id)`). `events` (returned beside it, so dedup can mark it while the
+/// copies are shared): one `PRec` per valid, in-time copy, by P2 partition (`hash(person)`).
+/// Dedup marks the `PRec` of every copy that loses; phase 3 reads the rest.
 pub struct EvChunk {
-    pub recs: Vec<EvRec>,
-    pub offs: Vec<u32>,
+    pub copies: Vec<EvCopy>,
+    pub coffs: Vec<u32>,
+    pub eoffs: Vec<u32>,
+    /// (price, category rank) of this chunk's valid purchases; `PRec::pay` is index + 1.
+    pub purchases: Vec<(u32, u32)>,
 }
 
 impl EvChunk {
     #[inline(always)]
-    pub fn part(&self, p: usize) -> &[EvRec] {
-        &self.recs[self.offs[p] as usize..self.offs[p + 1] as usize]
+    pub fn copies(&self, p: usize) -> &[EvCopy] {
+        &self.copies[self.coffs[p] as usize..self.coffs[p + 1] as usize]
     }
 }
 
 thread_local! {
-    static TMP: std::cell::RefCell<(Vec<EvRec>, Vec<u16>)> = const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+    static TMP: std::cell::RefCell<(Vec<EvRec>, Vec<u16>, Vec<u16>)> =
+        const { std::cell::RefCell::new((Vec::new(), Vec::new(), Vec::new())) };
 }
 
-/// Parses `data[start..end]`: records are written sequentially, then counting-sorted by the top bits
-/// of `hash(event_id)` into the chunk's own buffer.
-/// Parses one chunk into records counting-sorted by P1 partition. Each valid record's user is
-/// replaced by its person: the link-table slot is prefetched when the line is parsed and read
-/// `AHEAD` lines later, so the lookups overlap the parsing instead of stalling on memory.
-pub fn parse_chunk(parser: &EventParser, links: &LinkTable, data: &[u8], start: usize, end: usize, p1: usize, shift: u32) -> (EvChunk, ParseStats) {
+/// Turns per-partition counts (at `i + 1`) into start offsets.
+fn prefix(counts: &mut [u32]) {
+    for i in 1..counts.len() {
+        counts[i] += counts[i - 1];
+    }
+}
+
+/// Parses one chunk into its two streams. Each valid record's user is replaced by its person: the
+/// link-table slot is prefetched when the line is parsed and read `AHEAD` lines later, so the
+/// lookups overlap the parsing instead of stalling on memory.
+#[allow(clippy::too_many_arguments)]
+pub fn parse_chunk(parser: &EventParser, links: &LinkTable, data: &[u8], start: usize, end: usize, p1: usize, shift1: u32, p2: usize, shift2: u32) -> (EvChunk, Vec<PRec>, ParseStats) {
     TMP.with(|cell| {
         let mut guard = cell.borrow_mut();
-        let (tmp, parts) = &mut *guard;
+        let (tmp, ps, qs) = &mut *guard;
         tmp.clear();
-        parts.clear();
-        let mut offs = vec![0u32; p1 + 1];
+        ps.clear();
+        qs.clear();
+        let mut coffs = vec![0u32; p1 + 1];
+        let mut eoffs = vec![0u32; p2 + 1];
+        // Resolves record `r` to its person and notes its P2 partition (records resolve in order,
+        // so `qs` stays aligned with `tmp`).
+        let resolve = |r: &mut EvRec, qs: &mut Vec<u16>, eoffs: &mut [u32]| {
+            if r.valid() {
+                r.user = links.person(r.user);
+                let q = (mix(r.user) >> shift2) as usize;
+                eoffs[q + 1] += 1;
+                qs.push(q as u16);
+            } else {
+                qs.push(0);
+            }
+        };
         let mut st = ParseStats::default();
         st.lines = for_each_line::<7, _>(data, start, end, |f| match parser.parse(f) {
             Some(rec) => {
                 st.records += 1;
                 st.valid += rec.valid() as u64;
-                let p = (mix(rec.eid) >> shift) as usize;
-                offs[p + 1] += 1;
+                let p = (mix(rec.eid) >> shift1) as usize;
+                coffs[p + 1] += 1;
                 if rec.valid() {
                     links.prefetch(rec.user);
                 }
                 tmp.push(rec);
-                parts.push(p as u16);
+                ps.push(p as u16);
                 let n = tmp.len();
                 if n > AHEAD {
-                    let r = &mut tmp[n - 1 - AHEAD];
-                    if r.valid() {
-                        r.user = links.person(r.user);
-                    }
+                    resolve(&mut tmp[n - 1 - AHEAD], qs, &mut eoffs);
                 }
             }
             None => st.empty_id += 1,
         });
         let n = tmp.len();
         for r in tmp[n.saturating_sub(AHEAD)..].iter_mut() {
-            if r.valid() {
-                r.user = links.person(r.user);
-            }
+            resolve(r, qs, &mut eoffs);
         }
-        for i in 0..p1 {
-            offs[i + 1] += offs[i];
+        assert!(st.valid < NO_EVENT, "chunk too large");
+        prefix(&mut coffs);
+        prefix(&mut eoffs);
+        let mut ccur: Vec<u32> = coffs[..p1].to_vec();
+        let mut ecur: Vec<u32> = eoffs[..p2].to_vec();
+        let nv = eoffs[p2] as usize;
+        let mut copies: Vec<EvCopy> = Vec::with_capacity(n);
+        let mut events: Vec<PRec> = Vec::with_capacity(nv);
+        let mut purchases: Vec<(u32, u32)> = Vec::new();
+        let (cdst, edst) = (copies.as_mut_ptr(), events.as_mut_ptr());
+        for ((r, &p), &q) in tmp.iter().zip(ps.iter()).zip(qs.iter()) {
+            let at = if r.valid() {
+                let at = ecur[q as usize];
+                ecur[q as usize] += 1;
+                let pay = if r.pay & PURCHASE != 0 {
+                    purchases.push((r.pay & PRICE_MASK, r.category()));
+                    purchases.len() as u32
+                } else {
+                    0
+                };
+                // SAFETY: the cursors of all P2 partitions together cover 0..nv exactly once.
+                unsafe { edst.add(at as usize).write(PRec { person: r.user, ts: r.ts, pay }) };
+                at as u64
+            } else {
+                NO_EVENT
+            };
+            let c = ccur[p as usize];
+            ccur[p as usize] += 1;
+            // SAFETY: the cursors of all P1 partitions together cover 0..n exactly once.
+            unsafe { cdst.add(c as usize).write(EvCopy { eid: r.eid, ing_at: (r.ingest() << 24) | at }) };
         }
-        let mut cursor: Vec<u32> = offs[..p1].to_vec();
-        let mut recs: Vec<EvRec> = Vec::with_capacity(n);
-        let dst = recs.as_mut_ptr();
-        for (rec, &p) in tmp.iter().zip(parts.iter()) {
-            let at = cursor[p as usize] as usize;
-            cursor[p as usize] += 1;
-            // SAFETY: the cursors of all partitions together cover 0..n exactly once.
-            unsafe { dst.add(at).write(*rec) };
+        // SAFETY: every slot of both was written above.
+        unsafe {
+            copies.set_len(n);
+            events.set_len(nv);
         }
-        // SAFETY: every slot in 0..n was written above.
-        unsafe { recs.set_len(n) };
-        (EvChunk { recs, offs }, st)
+        (EvChunk { copies, coffs, eoffs, purchases }, events, st)
     })
 }
 

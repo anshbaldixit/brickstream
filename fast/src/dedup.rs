@@ -1,47 +1,33 @@
-//! Phase 2: event dedup and the move to person partitions.
+//! Phase 2: event dedup, in place.
 //!
-//! P1 partition `p` (top bits of `hash(event_id)`) holds every copy of its event IDs, one slice per
-//! parsing thread, so dedup is local: an open-addressing table keeps, per `event_id`, the copy with the
+//! P1 partition `p` (top bits of `hash(event_id)`) holds every copy of its event IDs (one slice per
+//! chunk), so dedup is local: an open-addressing table keeps, per `event_id`, the copy with the
 //! smallest `ingest_ts` (rules.md Events step 2; equal ingest times mean identical copies, either may
-//! stay). Other copies are marked in a loser bitmap. The kept copy is dropped if it is invalid or late
-//! (steps 3-4, decided per line in phase 1). Survivors (whose person was resolved while parsing) go to
-//! P2 partition `top bits of hash(person)` as 16-byte `PRec`s; a purchase's price and category go to
-//! the group's side table.
+//! stay). Every other copy loses, and if it has a `PRec` (it was valid and in time), that `PRec` is
+//! marked `DROPPED` where it lies in its person partition. A kept copy that is invalid or late has no
+//! `PRec` (steps 3-4, decided per line in phase 1), so its event is gone, whatever later copies say.
 
 use std::cell::RefCell;
 use std::time::Instant;
 
 use crate::clicks::ClickRec;
-use crate::events::{EvChunk, EvRec, PRICE_MASK, PURCHASE};
+use crate::events::{EvChunk, EvCopy, NO_EVENT};
 use crate::key::mix;
 
-/// One surviving event in a person partition.
+/// One valid, in-time event in a person partition.
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug)]
 pub struct PRec {
     pub person: u64,
+    /// `ts - window.base` in ms, or `DROPPED` once dedup has given the event to another copy.
     pub ts: u32,
-    /// 0: not a purchase. Otherwise `(thread << SIDE_BITS | index) + 1` into that thread's `purchases`.
+    /// 0: not a purchase. Otherwise index + 1 into its chunk's `purchases`.
     pub pay: u32,
 }
 
-/// Bits of the purchase index in `PRec::pay` (the dedup group, at most 256, takes the bits above).
-pub const SIDE_BITS: u32 = 23;
-
-/// The survivors of one P1 partition, counting-sorted by P2 partition.
-pub struct P2Part {
-    pub recs: Vec<PRec>,
-    pub offs: Vec<u32>,
-    /// (price, category rank) of its purchases.
-    pub purchases: Vec<(u32, u32)>,
-}
-
-impl P2Part {
-    #[inline(always)]
-    pub fn part(&self, q: usize) -> &[PRec] {
-        &self.recs[self.offs[q] as usize..self.offs[q + 1] as usize]
-    }
-}
+/// `PRec::ts` of a copy that lost dedup. Never a real offset: the window check keeps every offset
+/// below `u32::MAX`.
+pub const DROPPED: u32 = u32::MAX;
 
 /// One click chunk, resolved to persons and counting-sorted by P2 partition.
 pub struct ClChunk {
@@ -80,14 +66,33 @@ pub fn counting_sort<T: Copy>(items: &[T], qs: &[u16], p2: usize) -> (Vec<T>, Ve
     (out, offs)
 }
 
+/// Write access to every chunk's `PRec`s while dedup runs. Each `PRec` belongs to one copy, and
+/// each copy to one P1 partition, so no two dedup tasks ever write the same `PRec`, and nothing
+/// reads them until dedup is over.
+pub struct Marks(Vec<*mut PRec>);
+
+// SAFETY: see above; the pointers come from `&mut` borrows that end only after dedup.
+unsafe impl Sync for Marks {}
+unsafe impl Send for Marks {}
+
+impl Marks {
+    pub fn new(events: &mut [Vec<PRec>]) -> Marks {
+        Marks(events.iter_mut().map(|v| v.as_mut_ptr()).collect())
+    }
+
+    #[inline(always)]
+    fn drop_event(&self, chunk: usize, at: u64) {
+        // SAFETY: `at` indexes a written PRec of chunk `chunk` (from its EvCopy), and only this
+        // copy's dedup task writes it.
+        unsafe { (*self.0[chunk].add(at as usize)).ts = DROPPED };
+    }
+}
+
 #[derive(Default)]
 struct Scratch {
     /// Dedup table slots: `fingerprint << 32 | (index + 1)`, 0 = empty.
     slots: Vec<u64>,
-    losers: Vec<u64>,
     starts: Vec<usize>,
-    surv: Vec<PRec>,
-    qs: Vec<u16>,
 }
 
 thread_local! {
@@ -96,14 +101,14 @@ thread_local! {
 
 #[derive(Default, Clone, Copy, Debug)]
 pub struct DedupStats {
+    /// Copies (well-formed lines with an event_id).
     pub records: u64,
     pub losers: u64,
+    /// Kept copies that are invalid or late.
     pub kept_invalid: u64,
+    /// Kept copies that are valid: the events.
     pub survivors: u64,
-    pub purchases: u64,
-    pub ns_insert: u64,
-    pub ns_resolve: u64,
-    pub ns_scatter: u64,
+    pub ns: u64,
 }
 
 impl DedupStats {
@@ -112,119 +117,88 @@ impl DedupStats {
         self.losers += o.losers;
         self.kept_invalid += o.kept_invalid;
         self.survivors += o.survivors;
-        self.purchases += o.purchases;
-        self.ns_insert += o.ns_insert;
-        self.ns_resolve += o.ns_resolve;
-        self.ns_scatter += o.ns_scatter;
+        self.ns += o.ns;
     }
 }
 
-/// Dedups the P1 partitions `ps` (group `g`, one slice per chunk each) and returns their survivors
-/// together, counting-sorted by P2 partition. Tables stay per partition (small, in cache); grouping
-/// only makes the output fewer and longer slices for phase 3.
-pub fn group(g: usize, ps: std::ops::Range<usize>, chunks: &[EvChunk], p2: usize, shift2: u32) -> (P2Part, DedupStats) {
+/// Dedups the P1 partitions `ps`, marking every losing copy's `PRec` as `DROPPED`.
+pub fn group(ps: std::ops::Range<usize>, chunks: &[EvChunk], marks: &Marks) -> DedupStats {
+    let t = Instant::now();
     let mut st = DedupStats::default();
-    let out = SCRATCH.with(|cell| {
+    let mut slices: Vec<(usize, &[EvCopy])> = Vec::with_capacity(chunks.len());
+    SCRATCH.with(|cell| {
         let mut guard = cell.borrow_mut();
         let sc = &mut *guard;
-        sc.surv.clear();
-        sc.qs.clear();
-        let mut purchases: Vec<(u32, u32)> = Vec::new();
         for p in ps {
-            let slices: Vec<&[EvRec]> = chunks.iter().map(|c| c.part(p)).filter(|s| !s.is_empty()).collect();
-            one(&slices, sc, &mut purchases, g, shift2, &mut st);
+            slices.clear();
+            slices.extend(chunks.iter().enumerate().map(|(c, ch)| (c, ch.copies(p))).filter(|(_, s)| !s.is_empty()));
+            one(&slices, sc, marks, &mut st);
         }
-        st.purchases = purchases.len() as u64;
-        let t3 = Instant::now();
-        let (recs, offs) = counting_sort(&sc.surv, &sc.qs, p2);
-        st.ns_scatter += t3.elapsed().as_nanos() as u64;
-        P2Part { recs, offs, purchases }
     });
-    (out, st)
+    st.ns = t.elapsed().as_nanos() as u64;
+    st
 }
 
-/// Dedups one P1 partition, appending its valid kept copies to the group's survivors.
-fn one(slices: &[&[EvRec]], sc: &mut Scratch, purchases: &mut Vec<(u32, u32)>, g: usize, shift2: u32, st: &mut DedupStats) {
-        sc.starts.clear();
-        let mut n = 0usize;
-        for s in slices {
-            sc.starts.push(n);
-            n += s.len();
-        }
-        st.records += n as u64;
-        let t0 = Instant::now();
-        // 8-byte slots (half the size of key + index) keep the table in L2. A fingerprint match is
-        // confirmed against the record itself, so a collision can never merge two event IDs.
-        let cap = (2 * n).next_power_of_two().max(16);
-        let mask = cap - 1;
-        sc.slots.clear();
-        sc.slots.resize(cap, 0);
-        sc.losers.clear();
-        sc.losers.resize(n.div_ceil(64) + 1, 0);
-        let starts = &sc.starts;
-        let locate = |w: usize| -> &EvRec {
-            let s = starts.partition_point(|&st| st <= w) - 1;
-            &slices[s][w - starts[s]]
-        };
-        for (s, slice) in slices.iter().enumerate() {
-            let base = starts[s];
-            for (j, rec) in slice.iter().enumerate() {
-                let i = base + j;
-                let hm = mix(rec.eid);
-                let fp = hm >> 32;
-                let mut h = hm as usize & mask;
-                loop {
-                    let v = sc.slots[h];
-                    if v == 0 {
-                        sc.slots[h] = (fp << 32) | (i as u64 + 1);
+/// Dedups one P1 partition: `(chunk, copies)` slices.
+fn one(slices: &[(usize, &[EvCopy])], sc: &mut Scratch, marks: &Marks, st: &mut DedupStats) {
+    sc.starts.clear();
+    let mut n = 0usize;
+    for (_, s) in slices {
+        sc.starts.push(n);
+        n += s.len();
+    }
+    // 8-byte slots (half the size of key + index) keep the table in L2. A fingerprint match is
+    // confirmed against the copy itself, so a collision can never merge two event IDs.
+    let cap = (2 * n).next_power_of_two().max(16);
+    let mask = cap - 1;
+    sc.slots.clear();
+    sc.slots.resize(cap, 0);
+    let starts = &sc.starts;
+    let locate = |w: usize| -> (usize, &EvCopy) {
+        let s = starts.partition_point(|&x| x <= w) - 1;
+        (slices[s].0, &slices[s].1[w - starts[s]])
+    };
+    let (mut losers, mut no_event, mut lost_no_event) = (0u64, 0u64, 0u64);
+    for (s, &(chunk, slice)) in slices.iter().enumerate() {
+        let base = starts[s];
+        for (j, rec) in slice.iter().enumerate() {
+            let i = base + j;
+            no_event += (rec.at() == NO_EVENT) as u64;
+            let hm = mix(rec.eid);
+            let fp = hm >> 32;
+            let mut h = hm as usize & mask;
+            loop {
+                let v = sc.slots[h];
+                if v == 0 {
+                    sc.slots[h] = (fp << 32) | (i as u64 + 1);
+                    break;
+                }
+                if v >> 32 == fp {
+                    let (ochunk, other) = locate((v as u32 - 1) as usize);
+                    if other.eid == rec.eid {
+                        // The smaller ingest time keeps the event; on a tie the first copy stays.
+                        let (lchunk, lat) = if rec.ingest() < other.ingest() {
+                            sc.slots[h] = (fp << 32) | (i as u64 + 1);
+                            (ochunk, other.at())
+                        } else {
+                            (chunk, rec.at())
+                        };
+                        if lat == NO_EVENT {
+                            lost_no_event += 1;
+                        } else {
+                            marks.drop_event(lchunk, lat);
+                        }
+                        losers += 1;
                         break;
                     }
-                    if v >> 32 == fp {
-                        let w = (v as u32 - 1) as usize;
-                        let other = locate(w);
-                        if other.eid == rec.eid {
-                            let lose = if rec.ingest() < other.ingest() {
-                                sc.slots[h] = (fp << 32) | (i as u64 + 1);
-                                w
-                            } else {
-                                i
-                            };
-                            sc.losers[lose / 64] |= 1 << (lose % 64);
-                            st.losers += 1;
-                            break;
-                        }
-                    }
-                    h = (h + 1) & mask;
                 }
+                h = (h + 1) & mask;
             }
         }
-        st.ns_insert += t0.elapsed().as_nanos() as u64;
-
-        // The kept copies that are valid.
-        let t1 = Instant::now();
-        for (s, slice) in slices.iter().enumerate() {
-            let base = sc.starts[s];
-            for (j, rec) in slice.iter().enumerate() {
-                let i = base + j;
-                if sc.losers[i / 64] >> (i % 64) & 1 != 0 {
-                    continue;
-                }
-                if !rec.valid() {
-                    st.kept_invalid += 1;
-                    continue;
-                }
-                let pay = if rec.pay & PURCHASE != 0 {
-                    let idx = purchases.len() as u32;
-                    assert!(idx >> SIDE_BITS == 0, "too many purchases in one dedup group");
-                    purchases.push((rec.pay & PRICE_MASK, rec.category()));
-                    (((g as u32) << SIDE_BITS) | idx) + 1
-                } else {
-                    0
-                };
-                sc.surv.push(PRec { person: rec.user, ts: rec.ts, pay });
-                sc.qs.push((mix(rec.user) >> shift2) as u16);
-                st.survivors += 1;
-            }
-        }
-        st.ns_scatter += t1.elapsed().as_nanos() as u64;
+    }
+    let kept_invalid = no_event - lost_no_event;
+    st.records += n as u64;
+    st.losers += losers;
+    st.kept_invalid += kept_invalid;
+    st.survivors += n as u64 - losers - kept_invalid;
 }

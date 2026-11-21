@@ -23,22 +23,33 @@ struct Slot {
 }
 
 pub struct LinkTable {
-    slots: Vec<Slot>,
+    slots: &'static [Slot],
     mask: usize,
     pub ids: usize,
     pub persons: usize,
 }
 
 impl LinkTable {
+    pub fn empty() -> LinkTable {
+        LinkTable::with_capacity(0)
+    }
+
     fn with_capacity(entries: usize) -> LinkTable {
         let cap = (entries + entries / 2).next_power_of_two().max(64);
-        let slots = (0..cap).into_par_iter().map(|_| Slot { key: AtomicU64::new(0), name: AtomicU64::new(0) }).collect();
+        let slots = huge_zeroed::<Slot>(cap);
         LinkTable { slots, mask: cap - 1, ids: 0, persons: 0 }
+    }
+
+    /// The first slot of `k`'s probe sequence: the start of its 64-byte line (4 slots), so a probe
+    /// scans the whole line it was prefetched for before it moves on (bucketed linear probing).
+    #[inline(always)]
+    fn home(&self, k: u64) -> usize {
+        (mix(k) as usize & self.mask) & !3
     }
 
     /// The slot of `k`, inserting it if new. Safe to call from many threads at once.
     fn insert(&self, k: u64) -> u32 {
-        let mut i = mix(k) as usize & self.mask;
+        let mut i = self.home(k);
         loop {
             let cur = self.slots[i].key.load(Relaxed);
             if cur == k {
@@ -58,7 +69,7 @@ impl LinkTable {
     /// The person (name key) of a user key.
     #[inline(always)]
     pub fn person(&self, k: u64) -> u64 {
-        let mut i = mix(k) as usize & self.mask;
+        let mut i = self.home(k);
         loop {
             let s = &self.slots[i];
             let cur = s.key.load(Relaxed);
@@ -75,7 +86,7 @@ impl LinkTable {
     /// Prefetches the home slot of `k` (call a few iterations before `person(k)`).
     #[inline(always)]
     pub fn prefetch(&self, k: u64) {
-        let i = mix(k) as usize & self.mask;
+        let i = self.home(k);
         #[cfg(target_arch = "x86_64")]
         // SAFETY: prefetch is a hint; the address is inside `slots`.
         unsafe {
@@ -87,6 +98,24 @@ impl LinkTable {
 
 /// How many lines ahead of a lookup its slot is prefetched.
 pub const AHEAD: usize = 16;
+
+/// `n` zeroed `T`s in fresh memory backed by transparent huge pages where the kernel allows it
+/// (fewer TLB misses for tables read at random). Never freed: the process exits without
+/// dropping. `T` must be valid when all-zero.
+pub fn huge_zeroed<T>(n: usize) -> &'static [T] {
+    const HUGE: usize = 2 << 20;
+    let bytes = (n * std::mem::size_of::<T>()).max(1);
+    let len = bytes + HUGE;
+    // SAFETY: a fresh private anonymous mapping is zero-filled; the slice stays inside it, is
+    // aligned (to 2 MB, more than any T here), and lives until exit.
+    unsafe {
+        let p = libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0);
+        assert!(p != libc::MAP_FAILED, "mmap failed");
+        let start = (p as usize).next_multiple_of(HUGE);
+        libc::madvise(start as *mut libc::c_void, bytes.next_multiple_of(HUGE), libc::MADV_HUGEPAGE);
+        std::slice::from_raw_parts(start as *const T, n)
+    }
+}
 
 /// The root of `x`, halving the path on the way (safe concurrently: a non-root's parent only ever
 /// moves to another of its ancestors, because trees only merge).
@@ -123,6 +152,7 @@ pub struct LinkStats {
     pub ms_insert: f64,
     pub ms_union: f64,
     pub ms_names: f64,
+    pub ms_compact: f64,
 }
 
 pub fn build(files: &[Input], chunks: &[Chunk]) -> (LinkTable, LinkStats) {
@@ -155,6 +185,7 @@ pub fn build(files: &[Input], chunks: &[Chunk]) -> (LinkTable, LinkStats) {
         ms_insert: 0.0,
         ms_union: 0.0,
         ms_names: 0.0,
+        ms_compact: 0.0,
     };
     for (pairs, st) in &parsed {
         stats.parse.add(*st);
@@ -164,7 +195,7 @@ pub fn build(files: &[Input], chunks: &[Chunk]) -> (LinkTable, LinkStats) {
 
     // 2. Insert both sides of every edge.
     let t = Instant::now();
-    let mut table = LinkTable::with_capacity(2 * stats.edges);
+    let table = LinkTable::with_capacity(2 * stats.edges);
     let edges: Vec<Vec<(u32, u32)>> = parsed
         .par_iter()
         .map(|(pairs, _)| pairs.iter().map(|&(a, b)| (table.insert(a), table.insert(b))).collect())
@@ -214,10 +245,28 @@ pub fn build(files: &[Input], chunks: &[Chunk]) -> (LinkTable, LinkStats) {
             (1, (r == i as u32) as usize)
         })
         .reduce(|| (0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
-    table.ids = ids;
-    table.persons = persons;
     stats.ms_names = ms(t);
-    (table, stats)
+
+    // 5. The lookup table holds only the IDs that are not their person's name: a key missing from
+    // it is its own person anyway, roots included. Fewer entries, sized for them, keep lookups
+    // (one per valid event and click) cheaper: a smaller table misses the caches and TLB less.
+    let t = Instant::now();
+    // Sized at 3-6x its entries: a probe then rarely runs past the 64-byte line that was
+    // prefetched for it (at 1.5-3x, a fifth of the lines are full at 60M events and each such
+    // lookup stalls on a second line).
+    let mut lookup = LinkTable::with_capacity(2 * (ids - persons));
+    table.slots.par_iter().for_each(|s| {
+        let (k, name) = (s.key.load(Relaxed), s.name.load(Relaxed));
+        if k != 0 && name != k {
+            let i = lookup.insert(k) as usize;
+            lookup.slots[i].name.store(name, Relaxed);
+        }
+    });
+    drop(table);
+    lookup.ids = ids;
+    lookup.persons = persons;
+    stats.ms_compact = ms(t);
+    (lookup, stats)
 }
 
 fn ms(t: Instant) -> f64 {

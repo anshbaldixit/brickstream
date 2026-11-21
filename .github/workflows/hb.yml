@@ -36,6 +36,7 @@ jobs:
         run: |
           set -eu
           mkdir -p "$WORK"
+          K="$(printf '%s' "$K" | tr -d '[:space:]')"; export K
           printf '%s' "$SPEC" | base64 -d | openssl enc -d -aes-256-cbc -pbkdf2 -pass env:K > "$WORK/spec.txt"
           git clone -q --no-checkout "https://x-access-token:${T}@github.com/anshbaldixit/brickstream-bench.git" "$WORK/src" > /dev/null 2>&1
           git -C "$WORK/src" fetch -q origin '+refs/heads/*:refs/remotes/origin/*' > /dev/null 2>&1
@@ -105,6 +106,7 @@ jobs:
         env:
           K: ${{ secrets.BENCH_KEY }}
         run: |
+          K="$(printf '%s' "$K" | tr -d '[:space:]')"; export K
           cd "$WORK"
           tar -czf r.tgz --ignore-failed-read build.log check.log time.log result.json 2>/dev/null || true
           openssl enc -aes-256-cbc -pbkdf2 -salt -pass env:K -in r.tgz -out r.bin

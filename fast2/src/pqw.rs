@@ -41,7 +41,7 @@ impl<'a> Keys<'a> {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum IntEnc { Plain, Dense, Hash, Auto }
+pub enum IntEnc { Plain, Dense, DenseRange(i32, i32), Hash, Auto }
 
 #[derive(Clone, Copy)]
 pub enum Data<'a> {
@@ -228,6 +228,23 @@ const BLOCK: usize = 8192;
 
 #[inline(always)]
 unsafe fn pack_group<const W: u32>(p: *mut u8, v: [u32; 8]) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512vl", target_feature = "avx512bw", target_feature = "bmi2"))]
+    if W <= 16 {
+        use std::arch::x86_64::*;
+        let lanes = _mm256_loadu_si256(v.as_ptr() as *const __m256i);
+        if W <= 8 {
+            let bytes = _mm_cvtsi128_si64(_mm256_cvtepi32_epi8(lanes)) as u64;
+            let packed = _pext_u64(bytes, ((1u64 << W) - 1) * 0x0101_0101_0101_0101);
+            (p as *mut u64).write_unaligned(packed);
+        } else {
+            let words = _mm256_cvtepi32_epi16(lanes);
+            let mask = ((1u64 << W) - 1) * 0x0001_0001_0001_0001;
+            let lo = _pext_u64(_mm_cvtsi128_si64(words) as u64, mask) as u128;
+            let hi = _pext_u64(_mm_extract_epi64::<1>(words) as u64, mask) as u128;
+            (p as *mut u128).write_unaligned(lo | (hi << (4 * W)));
+        }
+        return;
+    }
     if W <= 8 {
         let mut x = 0u64;
         for k in 0..8 { x |= (v[k] as u64) << (k as u32 * W); }
@@ -329,7 +346,10 @@ fn plan_ints(v: Ints, enc: IntEnc) -> Plan {
     let n = v.len();
     if n == 0 || enc == IntEnc::Plain { return Plan::Plain; }
     if enc == IntEnc::Hash { return plan_hash(v); }
-    let (lo, hi) = v.minmax();
+    let (lo, hi) = match enc {
+        IntEnc::DenseRange(lo, hi) => (lo as i64, hi as i64),
+        _ => v.minmax(),
+    };
     let r = (hi as i128 - lo as i128) as u128;
     if r >= DENSE_MAX as u128 { return Plan::Plain; }
     let card = r as usize + 1;

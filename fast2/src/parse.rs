@@ -256,6 +256,16 @@ impl Part {
 }
 
 #[inline(always)]
+#[cfg(target_feature = "avx512ifma")]
+pub(crate) unsafe fn mul8(a: std::arch::x86_64::__m512i, b: std::arch::x86_64::__m512i) -> std::arch::x86_64::__m512i {
+    use std::arch::x86_64::*;
+    // Every caller reduces the product modulo 2^40. A 52-bit low multiply
+    // preserves those bits and processes all eight identifiers together.
+    _mm512_madd52lo_epu64(_mm512_setzero_si512(), a, b)
+}
+
+#[inline(always)]
+#[cfg(not(target_feature = "avx512ifma"))]
 pub(crate) unsafe fn mul8(a: std::arch::x86_64::__m512i, b: std::arch::x86_64::__m512i) -> std::arch::x86_64::__m512i {
     use std::arch::x86_64::*;
     let m = |x: __m256i, y: __m256i| {
@@ -298,6 +308,14 @@ unsafe fn st4<const D: usize>(a: *mut u8, i: usize, v: std::arch::x86_64::__m256
     std::arch::asm!("vmovdqa ymmword ptr [{a} + 8*{i} + {d}], {v}", a = in(reg) a, i = in(reg) i, d = const D, v = in(ymm_reg) v, options(nostack, preserves_flags));
 }
 #[inline(always)]
+#[cfg(target_feature = "avx512ifma")]
+unsafe fn mul4m<const D: usize>(base: *const u8, j: usize, b: std::arch::x86_64::__m256i) -> std::arch::x86_64::__m256i {
+    use std::arch::x86_64::*;
+    mul4(_mm256_load_si256(base.add(j * 8 + D).cast()), b)
+}
+
+#[inline(always)]
+#[cfg(not(target_feature = "avx512ifma"))]
 unsafe fn mul4m<const D: usize>(base: *const u8, j: usize, b: std::arch::x86_64::__m256i) -> std::arch::x86_64::__m256i {
     let o: std::arch::x86_64::__m256i;
     std::arch::asm!(
@@ -308,6 +326,14 @@ unsafe fn mul4m<const D: usize>(base: *const u8, j: usize, b: std::arch::x86_64:
     o
 }
 #[inline(always)]
+#[cfg(target_feature = "avx512ifma")]
+unsafe fn mul4(a: std::arch::x86_64::__m256i, b: std::arch::x86_64::__m256i) -> std::arch::x86_64::__m256i {
+    use std::arch::x86_64::*;
+    _mm256_madd52lo_epu64(_mm256_setzero_si256(), a, b)
+}
+
+#[inline(always)]
+#[cfg(not(target_feature = "avx512ifma"))]
 unsafe fn mul4(a: std::arch::x86_64::__m256i, b: std::arch::x86_64::__m256i) -> std::arch::x86_64::__m256i {
     let r: std::arch::x86_64::__m256i;
     std::arch::asm!("vpmullq {r}, {x}, {y}", r = lateout(ymm_reg) r, x = in(ymm_reg) a, y = in(ymm_reg) b, options(pure, nomem, nostack, preserves_flags));
@@ -641,33 +667,26 @@ struct EvP {
 #[inline(always)]
 unsafe fn ev_vec<const TSB: bool>(eb: &EvBatch, out: &mut Out, n: usize, p: &EvP) -> (u64, u64, bool) {
     use std::arch::x86_64::*;
-    let mut mk = [[0u8; 16]; 3];
-    let s = |v: u64| _mm256_set1_epi64x(v as i64);
+    let mut mk = [[0u8; 8]; 3];
+    let s = |v: u64| _mm512_set1_epi64(v as i64);
     let m40 = s(crate::keyrec::MASK);
     let binv = s(crate::keyrec::BINV);
     let ainv = s(crate::keyrec::AINV);
     let ukey = s(p.ukey & crate::keyrec::MASK);
     let ekey = s(p.ekey & crate::keyrec::MASK);
     let lim40 = s(1 << 40);
-    let unscr = |yb: __m256i, key: __m256i| {
-        let x = _mm256_and_si256(yb, m40);
-        let x = _mm256_xor_si256(x, _mm256_xor_si256(_mm256_srli_epi64::<17>(x), _mm256_srli_epi64::<34>(x)));
-        _mm256_and_si256(mul4(_mm256_xor_si256(x, key), ainv), m40)
+    let unscr = |yb: __m512i, key: __m512i| {
+        let x = _mm512_and_si512(yb, m40);
+        let x = _mm512_xor_si512(x, _mm512_xor_si512(_mm512_srli_epi64::<17>(x), _mm512_srli_epi64::<34>(x)));
+        _mm512_and_si512(mul8(_mm512_xor_si512(x, key), ainv), m40)
     };
-    let ebp = eb as *const EvBatch as *const u8;
-    const UID: usize = std::mem::offset_of!(EvBatch, uid);
-    const EID: usize = std::mem::offset_of!(EvBatch, eid);
-    const OB: usize = std::mem::offset_of!(Out, ob);
-    const LP: usize = std::mem::offset_of!(Out, lp);
-    const RC: usize = std::mem::offset_of!(Out, rec);
-    let outp = out as *mut Out as *mut u8;
     let ing_base = s(p.ing_base as u64);
     let ing_lim = s(ING_MAX * 1000);
     let ts_bad = s(TS_BAD as u64);
     let ws = s(p.ws as u64);
     let wlen = s(p.wlen);
     let empty = s(ID_EMPTY);
-    let zero = _mm256_setzero_si256();
+    let zero = _mm512_setzero_si512();
     let p24 = s(0xFF_FFFF);
     let day = s(DAY_MS as u64);
     let ucap = s(p.ucap);
@@ -678,53 +697,53 @@ unsafe fn ev_vec<const TSB: bool>(eb: &EvBatch, out: &mut Out, n: usize, p: &EvP
     let magic = s(274_877_907);
     let ones = s(u64::MAX);
     let lines = s(p.lines as u64);
-    let ix_lo = _mm256_setr_epi64x(0, 4, 1, 5);
-    let ix_hi = _mm256_setr_epi64x(2, 6, 3, 7);
+    let ix_lo = _mm512_setr_epi64(0, 8, 1, 9, 2, 10, 3, 11);
+    let ix_hi = _mm512_setr_epi64(4, 12, 5, 13, 6, 14, 7, 15);
     let mut j = 0;
     let mut g = 0;
     while j < n {
-        let ingr = _mm256_load_si256(eb.ing.as_ptr().add(j) as *const __m256i);
-        let ing = _mm256_sub_epi64(ingr, ing_base);
-        let bad = if TSB { kor(_mm256_cmpeq_epi64_mask(ingr, ts_bad), _mm256_cmpge_epu64_mask(ing, ing_lim)) } else { _mm256_cmpge_epu64_mask(ing, ing_lim) };
-        let ing_s = _mm256_srli_epi64::<38>(_mm256_mul_epu32(ing, magic));
-        let ts = _mm256_load_si256(eb.ts.as_ptr().add(j) as *const __m256i);
-        let rel = _mm256_sub_epi64(ts, ws);
-        let eid = _mm256_load_si256(eb.eid.as_ptr().add(j) as *const __m256i);
-        let uid = _mm256_load_si256(eb.uid.as_ptr().add(j) as *const __m256i);
-        let pp = _mm256_load_si256(eb.pp.as_ptr().add(j) as *const __m256i);
-        let price = _mm256_and_si256(_mm256_srli_epi64::<32>(pp), p24);
-        let valid = _mm256_cmpneq_epi64_mask(uid, empty);
-        let valid = _mm256_mask_cmplt_epu64_mask(valid, rel, wlen);
-        let valid = _mm256_mask_cmpgt_epi64_mask(valid, pp, ones);
-        let valid = _mm256_mask_cmple_epi64_mask(valid, _mm256_sub_epi64(ingr, ts), day);
-        let w = unscr(mul4m::<UID>(ebp, j, binv), ukey);
-        let user = _mm256_srli_epi64::<9>(w);
-        let alias = _mm256_and_si256(w, m511);
-        let normal = _mm256_mask_cmplt_epu64_mask(_mm256_mask_cmplt_epu64_mask(_mm256_cmplt_epu64_mask(uid, lim40), user, ucap), alias, nal);
-        let pm = _mm256_mask_cmpneq_epi64_mask(valid, price, zero);
-        let w0v = _mm256_or_si256(_mm256_or_si256(_mm256_slli_epi64::<33>(rel), _mm256_slli_epi64::<9>(price)), alias);
-        let w0v = _mm256_mask_blend_epi64(valid, ones, w0v);
-        let userv = _mm256_maskz_mov_epi64(valid, user);
-        let v = unscr(mul4m::<EID>(ebp, j, binv), ekey);
-        let evok = _mm256_mask_cmplt_epu64_mask(_mm256_cmplt_epu64_mask(eid, lim40), v, ecap);
-        let w1v = _mm256_or_si256(_mm256_and_si256(v, slotm), _mm256_or_si256(_mm256_slli_epi64::<16>(ing_s), _mm256_slli_epi64::<37>(userv)));
+        let ingr = _mm512_load_si512(eb.ing.as_ptr().add(j) as *const __m512i);
+        let ing = _mm512_sub_epi64(ingr, ing_base);
+        let bad = if TSB { kor(_mm512_cmpeq_epi64_mask(ingr, ts_bad), _mm512_cmpge_epu64_mask(ing, ing_lim)) } else { _mm512_cmpge_epu64_mask(ing, ing_lim) };
+        let ing_s = _mm512_srli_epi64::<38>(_mm512_mul_epu32(ing, magic));
+        let ts = _mm512_load_si512(eb.ts.as_ptr().add(j) as *const __m512i);
+        let rel = _mm512_sub_epi64(ts, ws);
+        let eid = _mm512_load_si512(eb.eid.as_ptr().add(j) as *const __m512i);
+        let uid = _mm512_load_si512(eb.uid.as_ptr().add(j) as *const __m512i);
+        let pp = _mm512_load_si512(eb.pp.as_ptr().add(j) as *const __m512i);
+        let price = _mm512_and_si512(_mm512_srli_epi64::<32>(pp), p24);
+        let valid = _mm512_cmpneq_epi64_mask(uid, empty);
+        let valid = _mm512_mask_cmplt_epu64_mask(valid, rel, wlen);
+        let valid = _mm512_mask_cmpgt_epi64_mask(valid, pp, ones);
+        let valid = _mm512_mask_cmple_epi64_mask(valid, _mm512_sub_epi64(ingr, ts), day);
+        let w = unscr(mul8(uid, binv), ukey);
+        let user = _mm512_srli_epi64::<9>(w);
+        let alias = _mm512_and_si512(w, m511);
+        let normal = _mm512_mask_cmplt_epu64_mask(_mm512_mask_cmplt_epu64_mask(_mm512_cmplt_epu64_mask(uid, lim40), user, ucap), alias, nal);
+        let pm = _mm512_mask_cmpneq_epi64_mask(valid, price, zero);
+        let w0v = _mm512_or_si512(_mm512_or_si512(_mm512_slli_epi64::<33>(rel), _mm512_slli_epi64::<9>(price)), alias);
+        let w0v = _mm512_mask_blend_epi64(valid, ones, w0v);
+        let userv = _mm512_maskz_mov_epi64(valid, user);
+        let v = unscr(mul8(eid, binv), ekey);
+        let evok = _mm512_mask_cmplt_epu64_mask(_mm512_cmplt_epu64_mask(eid, lim40), v, ecap);
+        let w1v = _mm512_or_si512(_mm512_and_si512(v, slotm), _mm512_or_si512(_mm512_slli_epi64::<16>(ing_s), _mm512_slli_epi64::<37>(userv)));
         let ok = kandn(kandn(normal, valid), evok);
-        let bv = _mm256_srli_epi64::<{ BB as i32 }>(v);
-        st4::<RC>(outp, 2 * j, _mm256_permutex2var_epi64(w0v, ix_lo, w1v));
-        st4::<{ RC + 32 }>(outp, 2 * j, _mm256_permutex2var_epi64(w0v, ix_hi, w1v));
-        st4::<OB>(outp, j, bv);
-        st4::<LP>(outp, j, _mm256_add_epi64(_mm256_slli_epi64::<6>(bv), lines));
+        let bv = _mm512_srli_epi64::<{ BB as u32 }>(v);
+        _mm512_store_si512(out.rec.as_mut_ptr().add(j).cast(), _mm512_permutex2var_epi64(w0v, ix_lo, w1v));
+        _mm512_store_si512(out.rec.as_mut_ptr().add(j + 4).cast(), _mm512_permutex2var_epi64(w0v, ix_hi, w1v));
+        _mm512_store_si512(out.ob.as_mut_ptr().add(j).cast(), bv);
+        _mm512_store_si512(out.lp.as_mut_ptr().add(j).cast(), _mm512_add_epi64(_mm512_slli_epi64::<6>(bv), lines));
         kst(mk[0].as_mut_ptr(), g, bad);
         kst(mk[1].as_mut_ptr(), g, pm);
         kst(mk[2].as_mut_ptr(), g, ok);
-        j += 4;
+        j += 8;
         g += 1;
     }
     let nm = if n >= 64 { !0 } else { (1u64 << n) - 1 };
-    let badb = mask64(&mk[0]);
-    let okb = mask64(&mk[2]) & nm;
+    let badb = u64::from_le_bytes(mk[0]);
+    let okb = u64::from_le_bytes(mk[2]) & nm;
     let spb = !okb & nm;
-    let mut pmb = mask64(&mk[1]) & nm;
+    let mut pmb = u64::from_le_bytes(mk[1]) & nm;
     while pmb != 0 {
         let i = pmb.trailing_zeros() as usize;
         pmb &= pmb - 1;
@@ -749,8 +768,8 @@ struct CkP {
 #[inline(always)]
 unsafe fn ck_vec<const RANGED: bool, const MODE_A: bool>(cb: &CkBatch, out: &mut Out, n: usize, p: &CkP) -> (u64, u64) {
     use std::arch::x86_64::*;
-    let mut mk = [[0u8; 16]; 2];
-    let s = |v: u64| _mm256_set1_epi64x(v as i64);
+    let mut mk = [[0u8; 8]; 2];
+    let s = |v: u64| _mm512_set1_epi64(v as i64);
     let m40 = s(crate::keyrec::MASK);
     let binv = s(crate::keyrec::BINV);
     let ainv = s(crate::keyrec::AINV);
@@ -767,61 +786,55 @@ unsafe fn ck_vec<const RANGED: bool, const MODE_A: bool>(cb: &CkBatch, out: &mut
     let ulo = s(UBSIZE as u64 - 1);
     let lines = s(p.lines as u64);
     let (clo, cspan) = (s(p.crange.unwrap_or((0, 0)).0), s(p.crange.unwrap_or((0, 0)).1));
-    let cbp = cb as *const CkBatch as *const u8;
-    const UID: usize = std::mem::offset_of!(CkBatch, uid);
-    const OB: usize = std::mem::offset_of!(Out, ob);
-    const LP: usize = std::mem::offset_of!(Out, lp);
-    const RC: usize = std::mem::offset_of!(Out, rec);
-    let outp = out as *mut Out as *mut u8;
-    let ix_lo = _mm256_setr_epi64x(0, 4, 1, 5);
-    let ix_hi = _mm256_setr_epi64x(2, 6, 3, 7);
+    let ix_lo = _mm512_setr_epi64(0, 8, 1, 9, 2, 10, 3, 11);
+    let ix_hi = _mm512_setr_epi64(4, 12, 5, 13, 6, 14, 7, 15);
     let mut j = 0;
     let mut g = 0;
     while j < n {
-        let ts = _mm256_load_si256(cb.ts.as_ptr().add(j) as *const __m256i);
-        let rel = _mm256_sub_epi64(ts, cbase);
-        let cid = _mm256_load_si256(cb.cid.as_ptr().add(j) as *const __m256i);
-        let uid = _mm256_load_si256(cb.uid.as_ptr().add(j) as *const __m256i);
-        let camp = _mm256_load_si256(cb.camp.as_ptr().add(j) as *const __m256i);
+        let ts = _mm512_load_si512(cb.ts.as_ptr().add(j) as *const __m512i);
+        let rel = _mm512_sub_epi64(ts, cbase);
+        let cid = _mm512_load_si512(cb.cid.as_ptr().add(j) as *const __m512i);
+        let uid = _mm512_load_si512(cb.uid.as_ptr().add(j) as *const __m512i);
+        let camp = _mm512_load_si512(cb.camp.as_ptr().add(j) as *const __m512i);
         let incsv = if RANGED {
-            _mm256_cmple_epu64_mask(_mm256_sub_epi64(camp, clo), cspan)
+            _mm512_cmple_epu64_mask(_mm512_sub_epi64(camp, clo), cspan)
         } else {
-            let inb = _mm256_cmplt_epu64_mask(camp, cbound);
-            let ch = _mm256_and_si256(_mm256_mmask_i64gather_epi64::<1>(mff, inb, camp, p.ctab as *const i64), mff);
-            _mm256_mask_cmpneq_epi64_mask(inb, ch, mff)
+            let inb = _mm512_cmplt_epu64_mask(camp, cbound);
+            let ch = _mm512_and_si512(_mm512_mask_i64gather_epi64::<1>(mff, inb, camp, p.ctab as *const i64), mff);
+            _mm512_mask_cmpneq_epi64_mask(inb, ch, mff)
         };
-        let keep = _mm256_mask_cmplt_epu64_mask(_mm256_mask_cmpneq_epi64_mask(incsv, uid, empty), rel, clen);
-        let x = _mm256_and_si256(mul4m::<UID>(cbp, j, binv), m40);
-        let x = _mm256_xor_si256(x, _mm256_xor_si256(_mm256_srli_epi64::<17>(x), _mm256_srli_epi64::<34>(x)));
-        let w = _mm256_and_si256(mul4(_mm256_xor_si256(x, ukey), ainv), m40);
-        let u = _mm256_srli_epi64::<9>(w);
-        let alias = _mm256_and_si256(w, m511);
-        let ok = _mm256_mask_cmplt_epu64_mask(keep, uid, lim40);
-        let ok = _mm256_mask_cmplt_epu64_mask(ok, u, ucap);
-        let ok = _mm256_mask_cmplt_epu64_mask(ok, alias, nal);
-        let mut ok = _mm256_mask_cmplt_epu64_mask(ok, cid, lim40);
+        let keep = _mm512_mask_cmplt_epu64_mask(_mm512_mask_cmpneq_epi64_mask(incsv, uid, empty), rel, clen);
+        let x = _mm512_and_si512(mul8(uid, binv), m40);
+        let x = _mm512_xor_si512(x, _mm512_xor_si512(_mm512_srli_epi64::<17>(x), _mm512_srli_epi64::<34>(x)));
+        let w = _mm512_and_si512(mul8(_mm512_xor_si512(x, ukey), ainv), m40);
+        let u = _mm512_srli_epi64::<9>(w);
+        let alias = _mm512_and_si512(w, m511);
+        let ok = _mm512_mask_cmplt_epu64_mask(keep, uid, lim40);
+        let ok = _mm512_mask_cmplt_epu64_mask(ok, u, ucap);
+        let ok = _mm512_mask_cmplt_epu64_mask(ok, alias, nal);
+        let mut ok = _mm512_mask_cmplt_epu64_mask(ok, cid, lim40);
         let mut idw = cid;
         if MODE_A {
-            let y = _mm256_and_si256(mul4(cid, binv), m40);
-            let y = _mm256_xor_si256(y, _mm256_xor_si256(_mm256_srli_epi64::<17>(y), _mm256_srli_epi64::<34>(y)));
-            idw = _mm256_and_si256(mul4(_mm256_xor_si256(y, s(p.ckey & crate::keyrec::MASK)), ainv), m40);
-            ok = _mm256_mask_cmplt_epu64_mask(ok, idw, s(p.ccap));
+            let y = _mm512_and_si512(mul8(cid, binv), m40);
+            let y = _mm512_xor_si512(y, _mm512_xor_si512(_mm512_srli_epi64::<17>(y), _mm512_srli_epi64::<34>(y)));
+            idw = _mm512_and_si512(mul8(_mm512_xor_si512(y, s(p.ckey & crate::keyrec::MASK)), ainv), m40);
+            ok = _mm512_mask_cmplt_epu64_mask(ok, idw, s(p.ccap));
         }
-        let key = _mm256_or_si256(_mm256_slli_epi64::<32>(rel), _mm256_slli_epi64::<4>(camp));
-        let o0 = _mm256_or_si256(idw, _mm256_slli_epi64::<43>(_mm256_and_si256(u, ulo)));
-        let o1 = _mm256_or_si256(key, alias);
-        let bv = _mm256_srli_epi64::<{ UB as i32 }>(u);
-        st4::<RC>(outp, 2 * j, _mm256_permutex2var_epi64(o0, ix_lo, o1));
-        st4::<{ RC + 32 }>(outp, 2 * j, _mm256_permutex2var_epi64(o0, ix_hi, o1));
-        st4::<OB>(outp, j, bv);
-        st4::<LP>(outp, j, _mm256_add_epi64(_mm256_slli_epi64::<6>(bv), lines));
+        let key = _mm512_or_si512(_mm512_slli_epi64::<32>(rel), _mm512_slli_epi64::<4>(camp));
+        let o0 = _mm512_or_si512(idw, _mm512_slli_epi64::<43>(_mm512_and_si512(u, ulo)));
+        let o1 = _mm512_or_si512(key, alias);
+        let bv = _mm512_srli_epi64::<{ UB as u32 }>(u);
+        _mm512_store_si512(out.rec.as_mut_ptr().add(j).cast(), _mm512_permutex2var_epi64(o0, ix_lo, o1));
+        _mm512_store_si512(out.rec.as_mut_ptr().add(j + 4).cast(), _mm512_permutex2var_epi64(o0, ix_hi, o1));
+        _mm512_store_si512(out.ob.as_mut_ptr().add(j).cast(), bv);
+        _mm512_store_si512(out.lp.as_mut_ptr().add(j).cast(), _mm512_add_epi64(_mm512_slli_epi64::<6>(bv), lines));
         kst(mk[0].as_mut_ptr(), g, ok);
         kst(mk[1].as_mut_ptr(), g, keep);
-        j += 4;
+        j += 8;
         g += 1;
     }
     let nm = if n >= 64 { !0 } else { (1u64 << n) - 1 };
-    let (okb, kpb) = (mask64(&mk[0]), mask64(&mk[1]));
+    let (okb, kpb) = (u64::from_le_bytes(mk[0]), u64::from_le_bytes(mk[1]));
     (okb & nm, kpb & !okb & nm)
 }
 

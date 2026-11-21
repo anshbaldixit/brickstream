@@ -12,6 +12,7 @@ fn die(what: &str) -> ! {
 struct View {
     keys: *const u32,
     day: *const i32,
+    day_range: IntEnc,
     ses: *const i32,
     evs: *const i32,
     rev: *const i32,
@@ -24,10 +25,11 @@ struct View {
 }
 unsafe impl Send for View {}
 unsafe impl Sync for View {}
-fn view(c: &crate::core::Core) -> View {
+fn view(g: &G, c: &crate::core::Core) -> View {
     View {
         keys: c.keys.as_ptr(),
         day: c.day.as_ptr(),
+        day_range: IntEnc::DenseRange(g.day0, g.day0 + (g.nd - 1) as i32),
         ses: c.ses.as_ptr(),
         evs: c.evs.as_ptr(),
         rev: c.rev.as_ptr(),
@@ -41,7 +43,7 @@ fn view(c: &crate::core::Core) -> View {
 }
 
 fn write_piece(g: &G, t: usize, a: usize, b: usize, path: &Path, cats_off: &[u32], cats_data: &[u8], kbuf: &mut Vec<u32>) {
-    write_rows(&view(&g.t(t).core), a, b, path, cats_off, cats_data, kbuf)
+    write_rows(&view(g, &g.t(t).core), a, b, path, cats_off, cats_data, kbuf)
 }
 
 #[derive(Default)]
@@ -195,7 +197,7 @@ fn write_rows(v: &View, a: usize, b: usize, path: &Path, cats_off: &[u32], cats_
     let cols = unsafe {
         [
             Column { name: "user_id", data: Data::Dict { dict: StrCol { offsets: no, data: names }, keys: Keys::U32Off(keys, lo), nullable: false, plain: false } },
-            Column { name: "day", data: Data::Date(sl(v.day.add(a), n), IntEnc::Dense) },
+            Column { name: "day", data: Data::Date(sl(v.day.add(a), n), v.day_range) },
             Column { name: "sessions", data: Data::I32(sl(v.ses.add(a), n), IntEnc::Dense) },
             Column { name: "events", data: Data::I32(sl(v.evs.add(a), n), IntEnc::Auto) },
             Column { name: "revenue_cents", data: Data::I32(sl(v.rev.add(a), n), IntEnc::Plain) },
@@ -500,7 +502,7 @@ pub fn stage45(g: &mut G, outdir: &str) {
         cats_off.push(cats_data.len() as u32);
     }
     let nt = g.nt;
-    let v3: Vec<View> = (0..nt).map(|t| view(&g.t(t).core)).collect();
+    let v3: Vec<View> = (0..nt).map(|t| view(g, &g.t(t).core)).collect();
     let pieces3 = cut_guided(&v3.iter().map(|v| (0, v.rows)).collect::<Vec<_>>(), nt);
     let order = crate::complex::shard_order(g);
     g.next.store(0, Ordering::Relaxed);
@@ -583,7 +585,7 @@ pub fn stage45(g: &mut G, outdir: &str) {
                 }
             } else {
                 let t = i - nt;
-                let v = view(&gr.t(t).core);
+                let v = view(gr, &gr.t(t).core);
                 if v.rows > v3[t].rows || (np == 0 && t == 0) {
                     write_rows(&v, v3[t].rows, v.rows, &ud.join(format!("part-{}.parquet", np + t)), &cats_off, &cats_data, &mut kbuf);
                 }

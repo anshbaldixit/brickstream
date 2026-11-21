@@ -1,0 +1,2 @@
+# Fixture bytes are exact test data (some lines end in \r on purpose): never convert line endings.
+* -text

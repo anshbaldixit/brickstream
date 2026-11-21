@@ -1,0 +1,7 @@
+user_id,day,sessions,events,revenue_cents,top_category
+pa,2026-10-03,1,1,10000000,shoes
+pc,2026-10-03,1,1,1,shoes
+pi,2026-10-03,1,1,500,shoes
+pp,2026-10-03,1,1,10000000,shoes
+ua,2026-10-03,1,1,0,
+whale,2026-10-05,1,220,2200000000,books

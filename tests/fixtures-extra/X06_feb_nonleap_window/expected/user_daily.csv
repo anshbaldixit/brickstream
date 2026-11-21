@@ -1,0 +1,6 @@
+user_id,day,sessions,events,revenue_cents,top_category
+uc,2027-02-28,1,2,1000,shoes
+ud,2027-02-28,1,1,0,
+ue,2027-03-01,1,1,0,
+uf,2027-02-22,1,1,0,
+uh,2027-03-07,1,1,0,

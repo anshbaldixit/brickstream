@@ -6,13 +6,15 @@
 //! copy can't change either. Invalid clicks (empty user, bad or out-of-window ts, unknown campaign)
 //! are dropped here, before any choice is made, so they can never hide a valid click.
 
-use crate::key::key_of;
+use crate::dedup::{counting_sort, ClChunk};
+use crate::key::{key_of, mix};
+use crate::links::{LinkTable, AHEAD};
 use crate::lookups::{Campaigns, Window};
 use crate::scan::for_each_line;
 use crate::ts::parse_ts;
 use crate::events::ParseStats;
 
-/// One valid click (24 bytes). `who` is the user key in phase 1 and the person key after phase 2.
+/// One valid click (24 bytes). `who` is the person key (resolved while parsing).
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub struct ClickRec {
@@ -51,16 +53,40 @@ impl ClickParser<'_> {
     }
 }
 
-pub fn parse_chunk(parser: &ClickParser, data: &[u8], start: usize, end: usize, out: &mut Vec<ClickRec>) -> ParseStats {
-    let mut st = ParseStats::default();
-    st.lines = for_each_line::<4, _>(data, start, end, |f| match parser.parse(f) {
-        Ok(Some(c)) => {
-            st.records += 1;
-            st.valid += 1;
-            out.push(c);
+thread_local! {
+    static TMP: std::cell::RefCell<(Vec<ClickRec>, Vec<u16>)> = const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+}
+
+/// Parses one chunk's valid clicks, resolves them to persons (prefetched `AHEAD` lines early, as for
+/// events) and counting-sorts them by P2 partition.
+pub fn parse_chunk(parser: &ClickParser, links: &LinkTable, data: &[u8], start: usize, end: usize, p2: usize, shift2: u32) -> (ClChunk, ParseStats) {
+    TMP.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        let (tmp, qs) = &mut *guard;
+        tmp.clear();
+        qs.clear();
+        let mut st = ParseStats::default();
+        st.lines = for_each_line::<4, _>(data, start, end, |f| match parser.parse(f) {
+            Ok(Some(c)) => {
+                st.records += 1;
+                st.valid += 1;
+                links.prefetch(c.who);
+                tmp.push(c);
+                let n = tmp.len();
+                if n > AHEAD {
+                    let r = &mut tmp[n - 1 - AHEAD];
+                    r.who = links.person(r.who);
+                }
+            }
+            Ok(None) => st.records += 1,
+            Err(()) => st.empty_id += 1,
+        });
+        let n = tmp.len();
+        for r in tmp[n.saturating_sub(AHEAD)..].iter_mut() {
+            r.who = links.person(r.who);
         }
-        Ok(None) => st.records += 1,
-        Err(()) => st.empty_id += 1,
-    });
-    st
+        qs.extend(tmp.iter().map(|c| (mix(c.who) >> shift2) as u16));
+        let (recs, offs) = counting_sort(tmp, qs, p2);
+        (ClChunk { recs, offs }, st)
+    })
 }

@@ -6,6 +6,7 @@
 //! dedup keeps. Phase 2 (dedup + resolve) lives below.
 
 use crate::key::{key_of, mix};
+use crate::links::{LinkTable, AHEAD};
 use crate::lookups::{Products, Window};
 use crate::scan::{for_each_line, LineStats};
 use crate::ts::{parse_ingest_seconds, parse_ts, MS_PER_SECOND};
@@ -15,7 +16,7 @@ use crate::ts::{parse_ingest_seconds, parse_ts, MS_PER_SECOND};
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub struct EvRec {
     pub eid: u64,
-    /// The user key (valid events only, else 0).
+    /// The person key, resolved while parsing (valid events only, else 0).
     pub user: u64,
     /// `(ingest_seconds + 2^39) << 24 | category rank`. Dedup compares `ing_cat >> 24`.
     pub ing_cat: u64,
@@ -182,7 +183,10 @@ thread_local! {
 
 /// Parses `data[start..end]`: records are written sequentially, then counting-sorted by the top bits
 /// of `hash(event_id)` into the chunk's own buffer.
-pub fn parse_chunk(parser: &EventParser, data: &[u8], start: usize, end: usize, p1: usize, shift: u32) -> (EvChunk, ParseStats) {
+/// Parses one chunk into records counting-sorted by P1 partition. Each valid record's user is
+/// replaced by its person: the link-table slot is prefetched when the line is parsed and read
+/// `AHEAD` lines later, so the lookups overlap the parsing instead of stalling on memory.
+pub fn parse_chunk(parser: &EventParser, links: &LinkTable, data: &[u8], start: usize, end: usize, p1: usize, shift: u32) -> (EvChunk, ParseStats) {
     TMP.with(|cell| {
         let mut guard = cell.borrow_mut();
         let (tmp, parts) = &mut *guard;
@@ -196,16 +200,31 @@ pub fn parse_chunk(parser: &EventParser, data: &[u8], start: usize, end: usize, 
                 st.valid += rec.valid() as u64;
                 let p = (mix(rec.eid) >> shift) as usize;
                 offs[p + 1] += 1;
+                if rec.valid() {
+                    links.prefetch(rec.user);
+                }
                 tmp.push(rec);
                 parts.push(p as u16);
+                let n = tmp.len();
+                if n > AHEAD {
+                    let r = &mut tmp[n - 1 - AHEAD];
+                    if r.valid() {
+                        r.user = links.person(r.user);
+                    }
+                }
             }
             None => st.empty_id += 1,
         });
+        let n = tmp.len();
+        for r in tmp[n.saturating_sub(AHEAD)..].iter_mut() {
+            if r.valid() {
+                r.user = links.person(r.user);
+            }
+        }
         for i in 0..p1 {
             offs[i + 1] += offs[i];
         }
         let mut cursor: Vec<u32> = offs[..p1].to_vec();
-        let n = tmp.len();
         let mut recs: Vec<EvRec> = Vec::with_capacity(n);
         let dst = recs.as_mut_ptr();
         for (rec, &p) in tmp.iter().zip(parts.iter()) {

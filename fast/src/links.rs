@@ -83,21 +83,10 @@ impl LinkTable {
         }
     }
 
-    /// Replaces every key in `keys` by its person, prefetching ahead.
-    #[inline]
-    pub fn resolve(&self, keys: &mut [u64]) {
-        const AHEAD: usize = 16;
-        for k in keys.iter().take(AHEAD) {
-            self.prefetch(*k);
-        }
-        for i in 0..keys.len() {
-            if i + AHEAD < keys.len() {
-                self.prefetch(keys[i + AHEAD]);
-            }
-            keys[i] = self.person(keys[i]);
-        }
-    }
 }
+
+/// How many lines ahead of a lookup its slot is prefetched.
+pub const AHEAD: usize = 16;
 
 /// The root of `x`, halving the path on the way (safe concurrently: a non-root's parent only ever
 /// moves to another of its ancestors, because trees only merge).

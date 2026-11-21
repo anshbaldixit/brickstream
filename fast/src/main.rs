@@ -76,6 +76,11 @@ fn usage() -> (u64, u64) {
     (ms(ru.ru_utime) + ms(ru.ru_stime), ru.ru_maxrss as u64 / 1024)
 }
 
+/// A tuning knob: `FAST_<name>` from the environment, else `d`.
+fn tune(name: &str, d: usize) -> usize {
+    std::env::var(format!("FAST_{name}")).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+}
+
 pub fn ms(t: Instant) -> f64 {
     t.elapsed().as_secs_f64() * 1000.0
 }
@@ -130,8 +135,12 @@ fn run(cfg: Config) {
     // Phase 1: links (table + union-find) alongside every event and click chunk.
     let t = Instant::now();
     let est_lines = ev_bytes / 76 + 1;
-    let p1 = (est_lines / 40_000).next_power_of_two().clamp(64, 4096);
+    // P1 (event_id) partitions small enough that a dedup table (8 bytes x 2 x lines) stays in L2;
+    // P2 (person) partitions from the same estimate, so clicks can be partitioned while parsed.
+    let p1 = (est_lines / tune("P1_LINES", 10_000)).next_power_of_two().clamp(64, 8192);
     let shift1 = 64 - p1.trailing_zeros();
+    let p2 = (est_lines / tune("P2_EVENTS", 32_000)).next_power_of_two().clamp(64, 2048);
+    let shift2 = 64 - p2.trailing_zeros();
     let ev_parser = EventParser { window, products: &products };
     let cl_parser = ClickParser { window, campaigns: &campaigns };
     if cfg.mode == "scan" || cfg.mode == "noemit" {
@@ -161,7 +170,7 @@ fn run(cfg: Config) {
         let t = Instant::now();
         let parsed: Vec<(EvChunk, ParseStats)> = ev_chunks
             .par_iter()
-            .map(|c| events::parse_chunk(&ev_parser, &ev_files[c.file as usize].data, c.start, c.end, p1, shift1))
+            .map(|c| events::parse_chunk(&ev_parser, &link_table, &ev_files[c.file as usize].data, c.start, c.end, p1, shift1))
             .collect();
         let mut ev_stats = ParseStats::default();
         for (_, st) in &parsed {
@@ -171,13 +180,9 @@ fn run(cfg: Config) {
         stage!("events_parse", t, "lines" = ev_stats.lines.lines, "malformed" = ev_stats.lines.malformed,
             "empty_id" = ev_stats.empty_id, "records" = ev_stats.records, "valid_lines" = ev_stats.valid, "p1" = p1);
         let t = Instant::now();
-        let cl: Vec<(Vec<ClickRec>, ParseStats)> = cl_chunks
+        let cl: Vec<(ClChunk, ParseStats)> = cl_chunks
             .par_iter()
-            .map(|c| {
-                let mut v = Vec::with_capacity((c.end - c.start) / 40);
-                let st = clicks::parse_chunk(&cl_parser, &cl_files[c.file as usize].data, c.start, c.end, &mut v);
-                (v, st)
-            })
+            .map(|c| clicks::parse_chunk(&cl_parser, &link_table, &cl_files[c.file as usize].data, c.start, c.end, p2, shift2))
             .collect();
         let mut st = ParseStats::default();
         for (_, s) in &cl {
@@ -185,7 +190,8 @@ fn run(cfg: Config) {
         }
         stage!("clicks_parse", t, "lines" = st.lines.lines, "malformed" = st.lines.malformed,
             "empty_id" = st.empty_id, "valid" = st.valid);
-        (ev_stats, ev_out, cl)
+        let cl_out: Vec<ClChunk> = cl.into_iter().map(|(c, _)| c).collect();
+        (ev_stats, ev_out, cl_out)
     };
     stage!("phase1", t);
     if cfg.mode == "parse" {
@@ -193,18 +199,13 @@ fn run(cfg: Config) {
         std::process::exit(0);
     }
 
-    // Phase 2: dedup per event_id partition, resolve persons, move to person partitions.
+    // Phase 2: dedup per event_id partition, move survivors to person partitions.
     let t = Instant::now();
-    let n_clicks: usize = cl_out.iter().map(|(v, _)| v.len()).sum();
     let est_ev = ev_stats.valid as usize + 1;
-    let p2 = (est_ev / 32_000).next_power_of_two().clamp(64, 2048);
-    let shift2 = 64 - p2.trailing_zeros();
-    let deduped: Vec<(P2Part, DedupStats)> = (0..p1)
+    let gsize = (p1 / tune("GROUPS", 256)).max(1);
+    let deduped: Vec<(P2Part, DedupStats)> = (0..p1 / gsize)
         .into_par_iter()
-        .map(|p| {
-            let slices: Vec<&[EvRec]> = ev_out.iter().map(|c| c.part(p)).filter(|s| !s.is_empty()).collect();
-            dedup::partition(p, &slices, &link_table, p2, shift2)
-        })
+        .map(|g| dedup::group(g, g * gsize..(g + 1) * gsize, &ev_out, p2, shift2))
         .collect();
     let mut dstats = DedupStats::default();
     for (_, d) in &deduped {
@@ -213,14 +214,9 @@ fn run(cfg: Config) {
     let parts: Vec<P2Part> = deduped.into_iter().map(|(p, _)| p).collect();
     stage!("dedup", t, "records" = dstats.records, "losers" = dstats.losers, "kept_invalid" = dstats.kept_invalid,
         "survivors" = dstats.survivors, "purchases" = dstats.purchases, "p2" = p2,
-        "cpu_insert_ms" = dstats.ns_insert / 1_000_000, "cpu_resolve_ms" = dstats.ns_resolve / 1_000_000,
-        "cpu_scatter_ms" = dstats.ns_scatter / 1_000_000);
-    let t = Instant::now();
-    let mut cl_out = cl_out;
-    let cl_parts: Vec<ClChunk> = cl_out.par_iter_mut().map(|(v, _)| dedup::clicks(v, &link_table, p2, shift2)).collect();
-    stage!("clicks_resolve", t, "clicks" = n_clicks);
+        "cpu_insert_ms" = dstats.ns_insert / 1_000_000, "cpu_scatter_ms" = dstats.ns_scatter / 1_000_000);
     std::mem::forget(ev_out);
-    std::mem::forget(cl_out);
+    let cl_parts = cl_out;
 
     // Phase 3: sessionize, credit and assist per person; largest partitions first.
     let t = Instant::now();

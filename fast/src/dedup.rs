@@ -4,18 +4,16 @@
 //! parsing thread, so dedup is local: an open-addressing table keeps, per `event_id`, the copy with the
 //! smallest `ingest_ts` (rules.md Events step 2; equal ingest times mean identical copies, either may
 //! stay). Other copies are marked in a loser bitmap. The kept copy is dropped if it is invalid or late
-//! (steps 3-4, decided per line in phase 1). Survivors get their person from the link table and go,
-//! through the thread's write-combining partitioner, to P2 partition `top bits of hash(person)` as
-//! 16-byte `PRec`s; a purchase's price and category go to the thread's side table. Clicks are resolved
-//! and partitioned the same way.
+//! (steps 3-4, decided per line in phase 1). Survivors (whose person was resolved while parsing) go to
+//! P2 partition `top bits of hash(person)` as 16-byte `PRec`s; a purchase's price and category go to
+//! the group's side table.
 
 use std::cell::RefCell;
 use std::time::Instant;
 
 use crate::clicks::ClickRec;
-use crate::events::{EvRec, PRICE_MASK, PURCHASE};
+use crate::events::{EvChunk, EvRec, PRICE_MASK, PURCHASE};
 use crate::key::mix;
-use crate::links::LinkTable;
 
 /// One surviving event in a person partition.
 #[repr(C)]
@@ -27,8 +25,8 @@ pub struct PRec {
     pub pay: u32,
 }
 
-/// Bits of the purchase index in `PRec::pay` (the P1 partition takes the bits above).
-pub const SIDE_BITS: u32 = 19;
+/// Bits of the purchase index in `PRec::pay` (the dedup group, at most 256, takes the bits above).
+pub const SIDE_BITS: u32 = 23;
 
 /// The survivors of one P1 partition, counting-sorted by P2 partition.
 pub struct P2Part {
@@ -59,7 +57,7 @@ impl ClChunk {
 }
 
 /// Counting sort of `items` by `qs` into a new buffer, with partition offsets.
-fn counting_sort<T: Copy>(items: &[T], qs: &[u16], p2: usize) -> (Vec<T>, Vec<u32>) {
+pub fn counting_sort<T: Copy>(items: &[T], qs: &[u16], p2: usize) -> (Vec<T>, Vec<u32>) {
     let mut offs = vec![0u32; p2 + 1];
     for &q in qs {
         offs[q as usize + 1] += 1;
@@ -121,21 +119,39 @@ impl DedupStats {
     }
 }
 
-const BATCH: usize = 256;
-
-/// Dedups P1 partition `p` (one slice per chunk) and returns its survivors by P2 partition.
-pub fn partition(p: usize, slices: &[&[EvRec]], links: &LinkTable, p2: usize, shift2: u32) -> (P2Part, DedupStats) {
+/// Dedups the P1 partitions `ps` (group `g`, one slice per chunk each) and returns their survivors
+/// together, counting-sorted by P2 partition. Tables stay per partition (small, in cache); grouping
+/// only makes the output fewer and longer slices for phase 3.
+pub fn group(g: usize, ps: std::ops::Range<usize>, chunks: &[EvChunk], p2: usize, shift2: u32) -> (P2Part, DedupStats) {
     let mut st = DedupStats::default();
     let out = SCRATCH.with(|cell| {
         let mut guard = cell.borrow_mut();
         let sc = &mut *guard;
+        sc.surv.clear();
+        sc.qs.clear();
+        let mut purchases: Vec<(u32, u32)> = Vec::new();
+        for p in ps {
+            let slices: Vec<&[EvRec]> = chunks.iter().map(|c| c.part(p)).filter(|s| !s.is_empty()).collect();
+            one(&slices, sc, &mut purchases, g, shift2, &mut st);
+        }
+        st.purchases = purchases.len() as u64;
+        let t3 = Instant::now();
+        let (recs, offs) = counting_sort(&sc.surv, &sc.qs, p2);
+        st.ns_scatter += t3.elapsed().as_nanos() as u64;
+        P2Part { recs, offs, purchases }
+    });
+    (out, st)
+}
+
+/// Dedups one P1 partition, appending its valid kept copies to the group's survivors.
+fn one(slices: &[&[EvRec]], sc: &mut Scratch, purchases: &mut Vec<(u32, u32)>, g: usize, shift2: u32, st: &mut DedupStats) {
         sc.starts.clear();
         let mut n = 0usize;
         for s in slices {
             sc.starts.push(n);
             n += s.len();
         }
-        st.records = n as u64;
+        st.records += n as u64;
         let t0 = Instant::now();
         // 8-byte slots (half the size of key + index) keep the table in L2. A fingerprint match is
         // confirmed against the record itself, so a collision can never merge two event IDs.
@@ -184,35 +200,8 @@ pub fn partition(p: usize, slices: &[&[EvRec]], links: &LinkTable, p2: usize, sh
         }
         st.ns_insert += t0.elapsed().as_nanos() as u64;
 
-        // The kept copies that are valid, resolved in batches so link lookups can be prefetched.
-        sc.surv.clear();
-        sc.qs.clear();
-        let mut purchases: Vec<(u32, u32)> = Vec::new();
-        let mut people = [0u64; BATCH];
-        let mut recs: [&EvRec; BATCH] = [&DUMMY; BATCH];
-        let mut fill = 0;
-        let mut flush = |people: &mut [u64; BATCH], recs: &[&EvRec; BATCH], fill: usize, sc: &mut Scratch, st: &mut DedupStats| {
-            let t1 = Instant::now();
-            links.resolve(&mut people[..fill]);
-            let t2 = Instant::now();
-            st.ns_resolve += (t2 - t1).as_nanos() as u64;
-            for b in 0..fill {
-                let r = recs[b];
-                let person = people[b];
-                let pay = if r.pay & PURCHASE != 0 {
-                    let idx = purchases.len() as u32;
-                    assert!(idx >> SIDE_BITS == 0, "too many purchases in one partition");
-                    purchases.push((r.pay & PRICE_MASK, r.category()));
-                    (((p as u32) << SIDE_BITS) | idx) + 1
-                } else {
-                    0
-                };
-                sc.surv.push(PRec { person, ts: r.ts, pay });
-                sc.qs.push((mix(person) >> shift2) as u16);
-            }
-            st.survivors += fill as u64;
-            st.ns_scatter += t2.elapsed().as_nanos() as u64;
-        };
+        // The kept copies that are valid.
+        let t1 = Instant::now();
         for (s, slice) in slices.iter().enumerate() {
             let base = sc.starts[s];
             for (j, rec) in slice.iter().enumerate() {
@@ -224,41 +213,18 @@ pub fn partition(p: usize, slices: &[&[EvRec]], links: &LinkTable, p2: usize, sh
                     st.kept_invalid += 1;
                     continue;
                 }
-                people[fill] = rec.user;
-                recs[fill] = rec;
-                fill += 1;
-                if fill == BATCH {
-                    flush(&mut people, &recs, fill, sc, &mut st);
-                    fill = 0;
-                }
+                let pay = if rec.pay & PURCHASE != 0 {
+                    let idx = purchases.len() as u32;
+                    assert!(idx >> SIDE_BITS == 0, "too many purchases in one dedup group");
+                    purchases.push((rec.pay & PRICE_MASK, rec.category()));
+                    (((g as u32) << SIDE_BITS) | idx) + 1
+                } else {
+                    0
+                };
+                sc.surv.push(PRec { person: rec.user, ts: rec.ts, pay });
+                sc.qs.push((mix(rec.user) >> shift2) as u16);
+                st.survivors += 1;
             }
         }
-        flush(&mut people, &recs, fill, sc, &mut st);
-        st.purchases = purchases.len() as u64;
-        let t3 = Instant::now();
-        let (recs, offs) = counting_sort(&sc.surv, &sc.qs, p2);
-        st.ns_scatter += t3.elapsed().as_nanos() as u64;
-        P2Part { recs, offs, purchases }
-    });
-    (out, st)
-}
-
-static DUMMY: EvRec = EvRec { eid: 0, user: 0, ing_cat: 0, ts: 0, pay: 0 };
-
-/// Resolves one chunk's valid clicks to persons and counting-sorts them by P2 partition.
-pub fn clicks(list: &mut [ClickRec], links: &LinkTable, p2: usize, shift2: u32) -> ClChunk {
-    let mut people = [0u64; BATCH];
-    let mut qs: Vec<u16> = Vec::with_capacity(list.len());
-    for block in list.chunks_mut(BATCH) {
-        for (p, c) in people.iter_mut().zip(block.iter()) {
-            *p = c.who;
-        }
-        links.resolve(&mut people[..block.len()]);
-        for (c, &p) in block.iter_mut().zip(people.iter()) {
-            c.who = p;
-            qs.push((mix(p) >> shift2) as u16);
-        }
-    }
-    let (recs, offs) = counting_sort(list, &qs, p2);
-    ClChunk { recs, offs }
+        st.ns_scatter += t1.elapsed().as_nanos() as u64;
 }

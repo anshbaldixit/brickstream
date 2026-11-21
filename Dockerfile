@@ -1,14 +1,24 @@
-# Submission image: the scorer builds this file. It mirrors fast/Dockerfile (Rust); keep the two identical.
+# Submission image: the scorer builds this file. It mirrors fast2/Dockerfile; keep the two identical.
 # Build context: the repository root.
-FROM rust:1.99-slim-bookworm AS build
-WORKDIR /build
-COPY fast/Cargo.toml fast/Cargo.lock ./
-COPY fast/.cargo ./.cargo
-# Dependencies first, so a source change doesn't rebuild them.
-RUN mkdir src && echo 'fn main() {}' > src/main.rs && cargo build --release --locked && rm -rf src
-COPY fast/src ./src
-RUN touch src/main.rs && cargo build --release --locked && cp target/release/fast /usr/local/bin/fast
+FROM rust:1.99-alpine AS build
+RUN apk add --no-cache musl-dev gcc binutils
+WORKDIR /src
+COPY fast2/Cargo.toml fast2/Cargo.lock ./
+COPY fast2/.cargo .cargo
+COPY fast2/src src
+COPY fast2/build/choose.c /tmp/choose.c
+RUN cc -O2 -march=x86-64 -c /tmp/choose.c -o /tmp/choose.o \
+ && cargo rustc --locked --release --target x86_64-unknown-linux-musl -- \
+        -Clink-arg=/tmp/choose.o -Clink-arg=-Wl,--wrap=main \
+        -Clink-arg="$(cc -print-libgcc-file-name)" -Clink-arg=-lc \
+ && cp target/x86_64-unknown-linux-musl/release/pipeline /pipeline \
+ && cargo rustc --locked --release --target x86_64-unknown-linux-musl -- -Ctarget-feature=+avx512ifma \
+ && cp target/x86_64-unknown-linux-musl/release/pipeline /ifma \
+ && strip /pipeline /ifma
 
-FROM debian:bookworm-slim
-COPY --from=build /usr/local/bin/fast /usr/local/bin/fast
-CMD ["/usr/local/bin/fast"]
+FROM scratch
+COPY fast2/LICENSE /LICENSE
+COPY --from=build /pipeline /pipeline
+COPY --from=build /ifma /ifma
+USER 1000:1000
+CMD ["/pipeline"]

@@ -110,6 +110,36 @@ fn pext7(x: u64) -> u64 {
     }
 }
 
+/// The inverse of `pext7`: 56 bits back to 8 bytes of 7 bits each, most significant byte first.
+#[inline(always)]
+fn pdep7(x: u64) -> u64 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    {
+        // SAFETY: the target feature is enabled at compile time.
+        unsafe { core::arch::x86_64::_pdep_u64(x, LOW7) }
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    {
+        let mut out = 0u64;
+        for i in 0..8 {
+            out |= ((x >> (7 * i)) & 0x7F) << (8 * i);
+        }
+        out
+    }
+}
+
+/// A packed (not interned) key's ID without a loop: its first 8 bytes as a little-endian word
+/// (zero past the end), its 9th byte (0 if none) and its length.
+#[inline(always)]
+pub fn packed_bytes(key: Key) -> (u64, u8, usize) {
+    debug_assert!(key & INTERNED == 0);
+    let lo = pdep7(key >> 7).swap_bytes();
+    let ninth = (key & 0x7F) as u8;
+    // IDs hold no zero bytes, so the length is where the zero padding starts.
+    let n8 = (64 - lo.leading_zeros() as usize).div_ceil(8);
+    (lo, ninth, if ninth != 0 { 9 } else { n8 })
+}
+
 /// The key of a non-empty ID: packed if it fits (and interning isn't forced), else interned.
 #[inline(always)]
 pub fn key_of(b: &[u8]) -> Key {
@@ -282,6 +312,10 @@ mod tests {
                 assert_eq!(k & INTERNED, 0);
                 let mut buf = [0u8; 9];
                 assert_eq!(bytes_of(k, &mut buf), &id[..]);
+                let (lo, ninth, n) = packed_bytes(k);
+                let mut b = lo.to_le_bytes().to_vec();
+                b.push(ninth);
+                assert_eq!(&b[..n], &id[..], "{id:?}");
             }
         }
     }

@@ -1,17 +1,20 @@
-//! Phase 4: the two output tables as Parquet (rules.md "Outputs"), written by hand.
+//! The two output tables as Parquet (rules.md "Outputs"), written by hand.
 //!
-//! The files are deliberately simple: one row group, PLAIN encoding, no compression, no dictionary,
-//! no statistics, data pages of at most 65,536 rows. `day` is INT32 (DATE), strings are BYTE_ARRAY
-//! (STRING/UTF8), counts and sums are INT64; `top_category` is OPTIONAL, its definition levels a
-//! single bit-packed run. A table with no rows still gets a file (schema, no row groups).
+//! The files are deliberately simple: row groups of 16,384 rows with one page per column, PLAIN
+//! encoding, no compression, no dictionary, no statistics. `day` is INT32 (DATE), strings are
+//! BYTE_ARRAY (STRING/UTF8), other integers INT32 or INT64; `top_category` is OPTIONAL, its
+//! definition levels one bit-packed run per page. A table with no rows still gets a file (schema,
+//! no row groups).
 //! The footer is Thrift compact protocol (parquet.thrift's FileMetaData).
 
+use std::io::Write;
 use std::path::Path;
 
-use crate::key::push_bytes;
+use crate::key::{packed_bytes, push_bytes, INTERNED};
 use crate::sessions::{Row, NO_CATEGORY};
 
-const PAGE_ROWS: usize = 65_536;
+/// Rows per row group (and page): 16,384 rows of `Row` stay in L2 while all columns are encoded.
+const GROUP_ROWS: usize = 16_384;
 
 // Thrift compact protocol type ids.
 const T_I32: u8 = 5;
@@ -107,6 +110,7 @@ pub enum Kind {
     Str,
     OptStr,
     Date,
+    I32,
     I64,
 }
 
@@ -114,7 +118,7 @@ impl Kind {
     fn physical(self) -> i32 {
         match self {
             Kind::Str | Kind::OptStr => 6, // BYTE_ARRAY
-            Kind::Date => 1,               // INT32
+            Kind::Date | Kind::I32 => 1,   // INT32
             Kind::I64 => 2,                // INT64
         }
     }
@@ -122,35 +126,44 @@ impl Kind {
 
 /// Writes one Parquet file. `encode(column, r0, r1, out)` appends the PLAIN page data of rows
 /// `r0..r1` (for `OptStr`: the definition levels with their length prefix, then the present values).
+///
+/// Rows go in row groups of `GROUP_ROWS`, one page per column each: every column of a group is
+/// encoded while the group's rows are still in cache, and each group is written from a reused
+/// buffer that is also still in cache, instead of a pass over all rows per column into one large
+/// buffer of fresh memory.
 pub fn write_parquet(path: &Path, cols: &[(&str, Kind)], rows: usize, encode: impl Fn(usize, usize, usize, &mut Vec<u8>)) {
-    let mut file: Vec<u8> = Vec::with_capacity(rows * 64 + 1024);
-    file.extend_from_slice(b"PAR1");
-    let mut chunks: Vec<(usize, usize)> = Vec::with_capacity(cols.len());
+    let mut file = std::fs::File::create(path).unwrap_or_else(|e| fail(path, e));
+    let mut buf: Vec<u8> = Vec::with_capacity(GROUP_ROWS * 48 + 4096);
+    buf.extend_from_slice(b"PAR1");
+    let mut at = 0usize; // file offset of buf[0]
+    // Per row group: its rows, then (offset, size) of each column chunk.
+    let mut groups: Vec<(usize, Vec<(usize, usize)>)> = Vec::with_capacity(rows.div_ceil(GROUP_ROWS));
     let mut page: Vec<u8> = Vec::new();
-    if rows > 0 {
+    for r0 in (0..rows).step_by(GROUP_ROWS) {
+        let r1 = (r0 + GROUP_ROWS).min(rows);
+        let mut chunks = Vec::with_capacity(cols.len());
         for ci in 0..cols.len() {
-            let start = file.len();
-            let mut r0 = 0;
-            while r0 < rows {
-                let r1 = (r0 + PAGE_ROWS).min(rows);
-                page.clear();
-                encode(ci, r0, r1, &mut page);
-                let mut h = Thrift::new();
-                h.i32(1, 0); // DATA_PAGE
-                h.i32(2, page.len() as i32);
-                h.i32(3, page.len() as i32);
-                h.begin(5); // DataPageHeader
-                h.i32(1, (r1 - r0) as i32);
-                h.i32(2, 0); // PLAIN
-                h.i32(3, 3); // definition levels: RLE
-                h.i32(4, 3); // repetition levels: RLE
-                h.end();
-                file.extend_from_slice(&h.finish());
-                file.extend_from_slice(&page);
-                r0 = r1;
-            }
-            chunks.push((start, file.len() - start));
+            let start = at + buf.len();
+            page.clear();
+            encode(ci, r0, r1, &mut page);
+            let mut h = Thrift::new();
+            h.i32(1, 0); // DATA_PAGE
+            h.i32(2, page.len() as i32);
+            h.i32(3, page.len() as i32);
+            h.begin(5); // DataPageHeader
+            h.i32(1, (r1 - r0) as i32);
+            h.i32(2, 0); // PLAIN
+            h.i32(3, 3); // definition levels: RLE
+            h.i32(4, 3); // repetition levels: RLE
+            h.end();
+            buf.extend_from_slice(&h.finish());
+            buf.extend_from_slice(&page);
+            chunks.push((start, at + buf.len() - start));
         }
+        groups.push((r1 - r0, chunks));
+        file.write_all(&buf).unwrap_or_else(|e| fail(path, e));
+        at += buf.len();
+        buf.clear();
     }
     let mut f = Thrift::new();
     f.i32(1, 1); // version
@@ -179,17 +192,16 @@ pub fn write_parquet(path: &Path, cols: &[(&str, Kind)], rows: usize, encode: im
                 f.end();
                 f.end();
             }
-            Kind::I64 => {}
+            Kind::I32 | Kind::I64 => {}
         }
         f.end();
     }
     f.i64(3, rows as i64);
-    if rows > 0 {
-        f.list(4, T_STRUCT, 1); // row_groups
+    f.list(4, T_STRUCT, groups.len()); // row_groups
+    for (n, chunks) in &groups {
         f.begin_element();
         f.list(1, T_STRUCT, cols.len()); // columns
-        for (ci, &(name, kind)) in cols.iter().enumerate() {
-            let (start, size) = chunks[ci];
+        for (&(name, kind), &(start, size)) in cols.iter().zip(chunks) {
             f.begin_element();
             f.i64(2, start as i64); // file_offset
             f.begin(3); // ColumnMetaData
@@ -200,7 +212,7 @@ pub fn write_parquet(path: &Path, cols: &[(&str, Kind)], rows: usize, encode: im
             f.list(3, T_BINARY, 1);
             f.binary_element(name.as_bytes());
             f.i32(4, 0); // UNCOMPRESSED
-            f.i64(5, rows as i64);
+            f.i64(5, *n as i64);
             f.i64(6, size as i64);
             f.i64(7, size as i64);
             f.i64(9, start as i64); // data_page_offset
@@ -209,19 +221,19 @@ pub fn write_parquet(path: &Path, cols: &[(&str, Kind)], rows: usize, encode: im
         }
         let total: usize = chunks.iter().map(|c| c.1).sum();
         f.i64(2, total as i64);
-        f.i64(3, rows as i64);
+        f.i64(3, *n as i64);
         f.end();
-    } else {
-        f.list(4, T_STRUCT, 0);
     }
     let footer = f.finish();
-    file.extend_from_slice(&footer);
-    file.extend_from_slice(&(footer.len() as u32).to_le_bytes());
-    file.extend_from_slice(b"PAR1");
-    if let Err(e) = std::fs::write(path, &file) {
-        eprintln!("fast: cannot write {}: {e}", path.display());
-        std::process::exit(3);
-    }
+    buf.extend_from_slice(&footer);
+    buf.extend_from_slice(&(footer.len() as u32).to_le_bytes());
+    buf.extend_from_slice(b"PAR1");
+    file.write_all(&buf).unwrap_or_else(|e| fail(path, e));
+}
+
+fn fail(path: &Path, e: std::io::Error) -> ! {
+    eprintln!("fast: cannot write {}: {e}", path.display());
+    std::process::exit(3);
 }
 
 #[inline]
@@ -230,9 +242,23 @@ fn put_str(out: &mut Vec<u8>, s: &[u8]) {
     out.extend_from_slice(s);
 }
 
+/// Appends `f(row)` for every row: fixed-width values, without a capacity check per value.
+#[inline(always)]
+fn put_each<T, const N: usize>(out: &mut Vec<u8>, rs: &[T], f: impl Fn(&T) -> [u8; N]) {
+    out.reserve(rs.len() * N);
+    let (base, mut p) = (out.as_mut_ptr(), out.len());
+    for r in rs {
+        // SAFETY: `reserve` made room for N bytes per row.
+        unsafe { base.add(p).cast::<[u8; N]>().write_unaligned(f(r)) };
+        p += N;
+    }
+    // SAFETY: every byte up to `p` was written above.
+    unsafe { out.set_len(p) };
+}
+
 /// Definition levels (bit width 1) as one bit-packed run, with the page's 4-byte length prefix.
-fn put_levels(out: &mut Vec<u8>, present: impl Iterator<Item = bool>, n: usize) {
-    let groups = n.div_ceil(8);
+fn put_levels<T>(out: &mut Vec<u8>, rs: &[T], present: impl Fn(&T) -> bool) {
+    let groups = rs.len().div_ceil(8);
     let mut header = Vec::with_capacity(10);
     let mut v = ((groups as u64) << 1) | 1;
     while v >= 0x80 {
@@ -242,42 +268,62 @@ fn put_levels(out: &mut Vec<u8>, present: impl Iterator<Item = bool>, n: usize) 
     header.push(v as u8);
     out.extend_from_slice(&((header.len() + groups) as u32).to_le_bytes());
     out.extend_from_slice(&header);
-    let at = out.len();
-    out.resize(at + groups, 0);
-    for (i, p) in present.enumerate() {
-        out[at + i / 8] |= (p as u8) << (i % 8);
+    out.extend(rs.chunks(8).map(|c| c.iter().enumerate().fold(0u8, |b, (j, r)| b | ((present(r) as u8) << j))));
+}
+
+/// The user_id column: each ID is a length prefix, then (for a packed key) 8 bytes written whole
+/// and its 9th byte, of which only the ID's length is kept.
+fn put_user_ids(out: &mut Vec<u8>, rs: &[Row]) {
+    if rs.iter().any(|r| r.person & INTERNED != 0) {
+        for r in rs {
+            let at = out.len();
+            out.extend_from_slice(&[0; 4]);
+            push_bytes(r.person, out);
+            let len = (out.len() - at - 4) as u32;
+            out[at..at + 4].copy_from_slice(&len.to_le_bytes());
+        }
+        return;
     }
+    out.reserve(rs.len() * 13);
+    let (base, mut p) = (out.as_mut_ptr(), out.len());
+    for r in rs {
+        let (lo, ninth, n) = packed_bytes(r.person);
+        // SAFETY: `reserve` made room for 13 bytes per row, and each row advances `p` by at most 13.
+        unsafe {
+            base.add(p).cast::<[u8; 4]>().write_unaligned((n as u32).to_le_bytes());
+            base.add(p + 4).cast::<[u8; 8]>().write_unaligned(lo.to_le_bytes());
+            *base.add(p + 12) = ninth;
+        }
+        p += 4 + n;
+    }
+    // SAFETY: every byte up to `p` was written above.
+    unsafe { out.set_len(p) };
 }
 
 pub fn write_user_daily(path: &Path, rows: &[Row], categories: &[Vec<u8>]) {
+    // rules.md: any integer width. Sessions and events per user-day stay far below 2^31; revenue
+    // can pass it (a person's purchases are summed), so it stays INT64.
     let cols = [
         ("user_id", Kind::Str),
         ("day", Kind::Date),
-        ("sessions", Kind::I64),
-        ("events", Kind::I64),
+        ("sessions", Kind::I32),
+        ("events", Kind::I32),
         ("revenue_cents", Kind::I64),
         ("top_category", Kind::OptStr),
     ];
+    let names: Vec<Vec<u8>> = categories.iter().map(|c| [&(c.len() as u32).to_le_bytes()[..], c].concat()).collect();
     write_parquet(path, &cols, rows.len(), |ci, r0, r1, out| {
         let rs = &rows[r0..r1];
         match ci {
-            0 => {
-                for r in rs {
-                    let at = out.len();
-                    out.extend_from_slice(&[0; 4]);
-                    push_bytes(r.person, out);
-                    let len = (out.len() - at - 4) as u32;
-                    out[at..at + 4].copy_from_slice(&len.to_le_bytes());
-                }
-            }
-            1 => rs.iter().for_each(|r| out.extend_from_slice(&r.day.to_le_bytes())),
-            2 => rs.iter().for_each(|r| out.extend_from_slice(&(r.sessions as i64).to_le_bytes())),
-            3 => rs.iter().for_each(|r| out.extend_from_slice(&(r.events as i64).to_le_bytes())),
-            4 => rs.iter().for_each(|r| out.extend_from_slice(&(r.revenue as i64).to_le_bytes())),
+            0 => put_user_ids(out, rs),
+            1 => put_each(out, rs, |r| r.day.to_le_bytes()),
+            2 => put_each(out, rs, |r| (r.sessions as i32).to_le_bytes()),
+            3 => put_each(out, rs, |r| (r.events as i32).to_le_bytes()),
+            4 => put_each(out, rs, |r| (r.revenue as i64).to_le_bytes()),
             _ => {
-                put_levels(out, rs.iter().map(|r| r.top != NO_CATEGORY), rs.len());
+                put_levels(out, rs, |r| r.top != NO_CATEGORY);
                 for r in rs.iter().filter(|r| r.top != NO_CATEGORY) {
-                    put_str(out, &categories[r.top as usize]);
+                    out.extend_from_slice(&names[r.top as usize]);
                 }
             }
         }

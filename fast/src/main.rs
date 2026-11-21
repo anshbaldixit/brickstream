@@ -1,9 +1,10 @@
 //! Shopping Sessions pipeline. Reads `$DATA_DIR`, writes `$OUTPUT_DIR/{user_daily,campaign_daily}`
 //! (or the last two arguments, DATA OUT). Stage timings go to stderr as `[fast] stage=... ms=...`.
 //!
-//! Phase 1 parses links (union-find on the side) while every event and click chunk is parsed in
-//! parallel. Phase 2 dedups events per `hash(event_id)` partition and moves events and clicks into
-//! `hash(person)` partitions. Phase 3 sessionizes each person. Phase 4 writes Parquet.
+//! Phase 1 builds the link table (union-find over every link ID), then parses every event and
+//! click chunk in parallel, resolving users to persons. Phase 2 dedups events per
+//! `hash(event_id)` partition in place. Phase 3 sessionizes each person per `hash(person)`
+//! partition; each worker writes its own user_daily file. Phase 4 writes campaign_daily.
 
 mod clicks;
 mod dedup;
@@ -261,20 +262,30 @@ fn run(cfg: Config) {
         purchases.extend_from_slice(&c.purchases);
     }
 
-    // Phase 3: sessionize, credit and assist per person; largest partitions first.
+    // Phase 3: sessionize, credit and assist per person; largest partitions first. Each worker
+    // writes its own user_daily file as soon as the partitions run out, while others finish.
     let t = Instant::now();
     let days = window.days();
     let n_camp = campaigns.len();
+    let ud = cfg.out.join("user_daily");
+    let cd = cfg.out.join("campaign_daily");
+    for dir in [&ud, &cd] {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            eprintln!("fast: cannot create {}: {e}", dir.display());
+            std::process::exit(3);
+        }
+    }
     let ctx = Ctx { window, events: &ev_src, purchases: &purchases, clicks: &cl_parts, campaigns: n_camp, categories: products.categories.len(), days };
     let mut order: Vec<(usize, usize)> = (0..p2)
         .map(|q| (ev_src.iter().map(|e| (e.offs[q + 1] - e.offs[q]) as usize).sum::<usize>() + cl_parts.iter().map(|c| c.part(q).len()).sum::<usize>(), q))
         .collect();
     order.sort_unstable_by(|a, b| b.cmp(a));
     let next = AtomicUsize::new(0);
-    let results: Mutex<Vec<(Vec<Row>, Vec<Acc>, Vec<Big>, u64, Vec<u32>)>> = Mutex::new(Vec::new());
+    let results: Mutex<Vec<Worker>> = Mutex::new(Vec::new());
     rayon::scope(|s| {
-        for _ in 0..threads {
-            s.spawn(|_| {
+        for w in 0..threads {
+            let (ctx, order, next, results, ud, categories) = (&ctx, &order, &next, &results, &ud, &products.categories);
+            s.spawn(move |_| {
                 let mut rows: Vec<Row> = Vec::with_capacity(est_ev / 8 / threads + 16);
                 let mut acc = vec![Acc::default(); (n_camp + 1) * days];
                 let mut assisted = vec![0u32; (n_camp + 1) * days];
@@ -285,17 +296,30 @@ fn run(cfg: Config) {
                     if i >= order.len() {
                         break;
                     }
-                    sessions += sessions::partition(&ctx, order[i].1, &mut rows, &mut acc, &mut assisted, &mut big);
+                    sessions += sessions::partition(ctx, order[i].1, &mut rows, &mut acc, &mut assisted, &mut big);
                 }
-                results.lock().unwrap().push((rows, acc, big, sessions, assisted));
+                let ms_sessions = ms(t);
+                // The first worker always writes, so the table has a file even with no rows.
+                if w == 0 || !rows.is_empty() {
+                    output::write_user_daily(&ud.join(format!("part-{w:05}.parquet")), &rows, categories);
+                }
+                let user_sessions = rows.iter().map(|r| r.sessions as u64).sum();
+                let user_revenue = rows.iter().map(|r| r.revenue).sum();
+                let done = Worker { rows: rows.len(), acc, assisted, big, sessions, user_sessions, user_revenue, ms_sessions, ms_written: ms(t) };
+                // The rows are written; freeing them would only cost time.
+                std::mem::forget(rows);
+                results.lock().unwrap().push(done);
             });
         }
     });
     let results = results.into_inner().unwrap();
-    let sessions_total: u64 = results.iter().map(|r| r.3).sum();
-    let user_rows: usize = results.iter().map(|r| r.0.len()).sum();
-    stage!("sessions", t, "sessions" = sessions_total, "user_daily_rows" = user_rows);
-    let mut bigs: Vec<Big> = results.iter().flat_map(|r| r.2.iter().copied()).collect();
+    let sessions_total: u64 = results.iter().map(|r| r.sessions).sum();
+    let user_rows: usize = results.iter().map(|r| r.rows).sum();
+    let last = |f: fn(&Worker) -> f64| results.iter().map(f).fold(0.0, f64::max);
+    stage!("sessions", t, "sessions" = sessions_total, "user_daily_rows" = user_rows,
+        "first_done_ms" = format!("{:.1}", results.iter().map(|r| r.ms_sessions).fold(f64::MAX, f64::min)),
+        "last_done_ms" = format!("{:.1}", last(|r| r.ms_sessions)), "last_written_ms" = format!("{:.1}", last(|r| r.ms_written)));
+    let mut bigs: Vec<Big> = results.iter().flat_map(|r| r.big.iter().copied()).collect();
     bigs.sort_unstable_by(|a, b| b.events.cmp(&a.events));
     for b in bigs.iter().take(3) {
         let mut name = Vec::new();
@@ -304,17 +328,17 @@ fn run(cfg: Config) {
             String::from_utf8_lossy(&name), b.events, b.clicks, b.sessions, b.micros as f64 / 1000.0);
     }
 
-    // Phase 4: write both tables.
+    // Phase 4: campaign_daily (user_daily is written by now).
     let t = Instant::now();
     let mut acc = vec![Acc::default(); (n_camp + 1) * days];
     let mut assisted = vec![0u64; (n_camp + 1) * days];
     for r in &results {
-        for (a, b) in acc.iter_mut().zip(r.1.iter()) {
+        for (a, b) in acc.iter_mut().zip(r.acc.iter()) {
             a.sessions += b.sessions;
             a.purchasing += b.purchasing;
             a.revenue += b.revenue;
         }
-        for (a, &b) in assisted.iter_mut().zip(r.4.iter()) {
+        for (a, &b) in assisted.iter_mut().zip(r.assisted.iter()) {
             *a += b as u64;
         }
     }
@@ -344,37 +368,29 @@ fn run(cfg: Config) {
         }
     }
     // Self-check (rules.md): sessions and revenue agree between the tables.
-    let user_sessions: u64 = results.iter().flat_map(|r| r.0.iter()).map(|r| r.sessions as u64).sum();
-    let user_revenue: u64 = results.iter().flat_map(|r| r.0.iter()).map(|r| r.revenue).sum();
+    let user_sessions: u64 = results.iter().map(|r| r.user_sessions).sum();
+    let user_revenue: u64 = results.iter().map(|r| r.user_revenue).sum();
     let camp_sessions: u64 = camp_rows.iter().map(|r| r.sessions).sum();
     let camp_revenue: u64 = camp_rows.iter().map(|r| r.revenue).sum();
     if user_sessions != camp_sessions || user_revenue != camp_revenue {
         eprintln!("[fast] SELF-CHECK FAILED sessions {user_sessions} vs {camp_sessions}, revenue {user_revenue} vs {camp_revenue}");
     }
-    let ud = cfg.out.join("user_daily");
-    let cd = cfg.out.join("campaign_daily");
-    for dir in [&ud, &cd] {
-        if let Err(e) = std::fs::create_dir_all(dir) {
-            eprintln!("fast: cannot create {}: {e}", dir.display());
-            std::process::exit(3);
-        }
-    }
-    rayon::join(
-        || {
-            results.par_iter().enumerate().for_each(|(i, r)| {
-                if i == 0 || !r.0.is_empty() {
-                    let t = Instant::now();
-                    output::write_user_daily(&ud.join(format!("part-{i:05}.parquet")), &r.0, &products.categories);
-                    if i < 2 {
-                        stage!("write_file", t, "rows" = r.0.len());
-                    }
-                }
-            })
-        },
-        || output::write_campaign_daily(&cd.join("part-00000.parquet"), &camp_rows),
-    );
+    output::write_campaign_daily(&cd.join("part-00000.parquet"), &camp_rows);
     stage!("write", t, "user_daily_rows" = user_rows, "campaign_daily_rows" = camp_rows.len());
     finish(t_start);
+}
+
+/// What one phase-3 worker hands back once its user_daily file is written.
+struct Worker {
+    rows: usize,
+    acc: Vec<Acc>,
+    assisted: Vec<u32>,
+    big: Vec<Big>,
+    sessions: u64,
+    user_sessions: u64,
+    user_revenue: u64,
+    ms_sessions: f64,
+    ms_written: f64,
 }
 
 /// Logs the totals and exits at once, without dropping anything (the kernel reclaims it all).

@@ -21,6 +21,15 @@ docker build -f ref/Dockerfile -t ss:ref .
 ```
 `run.py` applies the scorer's flags: read-only root, `/tmp` tmpfs of 64 MB, uid 1000, no network, `--cpus 8 --memory 24g` with no swap, and `/scratch` on a fresh volume. It times the container from start to exit using Docker's own timestamps.
 
+## Differential test (two implementations on many seeds)
+```
+.venv/Scripts/python.exe tools/diffseeds.py ss:ref ss:fast                    # data/dev + every data/s*-1m seed
+.venv/Scripts/python.exe tools/diffseeds.py ss:ref ss:fast vol:ss-s3-20m      # a big set
+.venv/Scripts/python.exe tools/diffseeds.py py:path/to/oracle.py ss:fast      # vs a native Python implementation (host folders only)
+```
+`py:<script>` runs a native implementation that takes `DATA OUT`.
+Extra 1M seeds are in `data/s2002-1m` through `data/s11011-1m`, with windows spread over 2025-2028. `data/s12053-1m` has a window of 2028-02-27 to 2028-03-12, so it contains **Feb 29, 2028** (76k event lines that day).
+
 ## Fixtures against a Docker image
 ```
 .venv/Scripts/python.exe kit/starter-duckdb/starter-duckdb/scripts/run_fixtures.py kit/starter-duckdb/starter-duckdb/fixtures -- .venv/Scripts/python.exe tools/run.py ss:ref

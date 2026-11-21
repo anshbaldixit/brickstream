@@ -1,6 +1,6 @@
 # Extra fixtures
 
-16 cases in the kit's format (`input/` laid out like `/data`, `expected/` as CSV with `day` as `YYYY-MM-DD` and an empty `top_category` for null). Each one pins rules that the kit's 36 fixtures leave uncovered. Every expected table was written by hand from `kit/rules.md`, and each case's `README.md` explains its rows. Rule IDs refer to `docs/spec-checklist.md`.
+21 cases in the kit's format (`input/` laid out like `/data`, `expected/` as CSV with `day` as `YYYY-MM-DD` and an empty `top_category` for null). Each one pins rules that the kit's 36 fixtures leave uncovered. Every expected table was written by hand from `kit/rules.md`, and each case's `README.md` explains its rows. Rule IDs refer to `docs/spec-checklist.md`.
 
 ```
 .venv/Scripts/python.exe kit/starter-duckdb/starter-duckdb/scripts/run_fixtures.py tests/fixtures-extra -- <cmd>
@@ -25,6 +25,11 @@ On Windows, write a venv Python in `<cmd>` as `'.venv\Scripts\python.exe'`; the 
 | X14_links | a 299-hop chain over 3 files; an upper-case link side splits a person; `\r` and a space in a link ID; a kiosk merging three people's sessions | yes (except `\r`, space) |
 | X15_odd_window | a 2.5-day window starting at noon: days are UTC dates, not offsets from window_start | no (rules only) |
 | X16_multi_file | several files per folder, non-`part-` names, header-only files, dedup and links across files | yes |
+| X17_gap_boundary | gap of exactly 1,800,000 ms stays one session, 1,800,001 splits (F1 and F3); equal ts share a session; a session crossing midnight belongs to its start day | yes |
+| X18_credit_tie_and_7d_edges | credit tie `k_10` < `k_9`; click exactly 7 d before counts, 7 d + 1 ms and 1 ms after the start do not; an assist-only campaign-day row (0 sessions, 1 assisted) | yes |
+| X19_non_midnight_16_day_window | window 05:30 to 05:30 over 16 days (17 calendar days); window edges to the second; click at exactly window_start − 7 d | no (generator windows are 14 days at midnight) |
+| X20_revenue_over_i32 | one person-day with revenue 2,160,000,000 (216 × 10,000,000), over 2^31 | yes |
+| X21_forty_categories | 40 categories; a tie between `unknown` and `zzz`; sum beats alphabet | no (generator has 20 categories) |
 
 ## How they were checked
 - `docs/tools/oracle.py`, an independent pure-Python implementation, passes all 36 kit fixtures, these 16, and the dev set (exact MATCH with `kit/dev-answer`).

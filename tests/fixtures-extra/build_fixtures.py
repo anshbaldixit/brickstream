@@ -845,6 +845,141 @@ assisted by c_1 and c_2. `e5` is u4's (earliest ingest, other file): credited c_
      ])
 
 
+# --------------------------------------------------------------------------- X17
+def ms(stamp, extra=0):
+    """F3 epoch-millisecond string for the F1 string `stamp`, plus `extra` ms."""
+    t = datetime.datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+    return str(int(t.timestamp()) * 1000 + extra)
+
+
+case("X17_gap_boundary", """\
+Session gap boundary (S1-S3, rules.md: a new session starts when the gap is *over* 1,800,000 ms)
+and the session's day (S5: the UTC date of its start).
+
+- u1 e1 10:00:00.000, e2 10:30:00.000: gap exactly 1,800,000 ms, so one session.
+- e3, e4, e5 at 11:00:00.001 (F3): 1,800,001 ms after e2, so a new session; the three equal
+  timestamps share it.
+- e6 at 23:59:59, e7 (a purchase of 300) at 00:10:00 the next day: one session that started on
+  Oct 3, so it is Oct 3's: no Oct 4 row.
+- u2 e8 10:00:00.000 and e9 10:30:00.000, both F3: exactly 1,800,000 ms, one session.
+
+u1: 3 sessions, 7 events, 300 cents, shoes. u2: 1 session, 2 events. organic: 4 sessions, 1 purchasing.
+""",
+     events=[
+         ev("e1", "u1", "2026-10-03T10:00:00Z"),
+         ev("e2", "u1", "2026-10-03T10:30:00Z"),
+         f"e3,u1,{ms('2026-10-03T11:00:00Z', 1)},2026-10-03T11:01:00Z,view,p1,",
+         f"e4,u1,{ms('2026-10-03T11:00:00Z', 1)},2026-10-03T11:01:00Z,view,p1,",
+         f"e5,u1,{ms('2026-10-03T11:00:00Z', 1)},2026-10-03T11:01:00Z,view,p1,",
+         ev("e6", "u1", "2026-10-03T23:59:59Z"),
+         ev("e7", "u1", "2026-10-04T00:10:00Z", "purchase", "p1", "300"),
+         f"e8,u2,{ms('2026-10-03T10:00:00Z')},2026-10-03T10:01:00Z,view,p1,",
+         f"e9,u2,{ms('2026-10-03T10:30:00Z')},2026-10-03T10:31:00Z,view,p1,",
+     ],
+     user_daily=[
+         "u1,2026-10-03,3,7,300,shoes",
+         "u2,2026-10-03,1,2,0,",
+     ],
+     campaign_daily=[
+         "organic,organic,2026-10-03,4,1,300,0",
+     ])
+
+# --------------------------------------------------------------------------- X18
+case("X18_credit_tie_and_7d_edges", """\
+Credit tie, the 7-day edges and assist-only campaign days (K5-K9, A1-A4). u1 has one view at
+Oct 10 12:00:00.000.
+
+| Click | Campaign | ts | Effect |
+|---|---|---|---|
+| `k_10` | c_1 | Oct 3 12:00:00.000 (exactly 7 d before) | qualifies; ties with `k_9` on ts |
+| `k_9` | c_2 | same ts | qualifies; `k_10` < `k_9` byte-wise, so c_1 is credited |
+| `k_old` | c_3 | Oct 3 11:59:59.999 (F3: 7 d + 1 ms before) | too old: neither credits nor assists |
+| `k_late` | c_3 | Oct 10 12:00:00.001 (F3, 1 ms after the start) | later than the session start: neither |
+
+c_1 is credited and assists; c_2 only assists, so its campaign-day row has 0 sessions and 1
+assisted session. c_3 has no row.
+""",
+     events=[ev("e1", "u1", "2026-10-10T12:00:00Z")],
+     clicks=[
+         "k_10,u1,c_1,2026-10-03T12:00:00Z",
+         "k_9,u1,c_2,2026-10-03T12:00:00Z",
+         f"k_old,u1,c_3,{ms('2026-10-03T11:59:59Z', 999)}",
+         f"k_late,u1,c_3,{ms('2026-10-10T12:00:00Z', 1)}",
+     ],
+     campaigns=["c_1,search", "c_2,social", "c_3,email"],
+     user_daily=["u1,2026-10-10,1,1,0,"],
+     campaign_daily=[
+         "c_1,search,2026-10-10,1,0,0,1",
+         "c_2,social,2026-10-10,0,0,0,1",
+     ])
+
+# --------------------------------------------------------------------------- X19
+case("X19_non_midnight_16_day_window", """\
+A 16-day window that starts at 05:30 (window 2026-10-01T05:30:00Z to 2026-10-17T05:30:00Z): 17
+calendar days are touched. Window edges (T9, T10), days are UTC dates (S5), and the click
+edge: exactly window_start - 7 d is in the click window.
+
+- u1 `e1` at 05:29:59 (before the window): dropped. `e2` at 05:30:00 (the first instant): kept,
+  Oct 1. Click `k1` (c_1) at Sep 24 05:30:00 is exactly 7 d before the session start: credits.
+- u3 `e3` 23:59:59 and `e4` 00:00:00 next day: one session, Oct 1, 2 events.
+- u2 `e5` at Oct 17 05:29:59: kept, day Oct 17. `e6` at exactly the window end: dropped.
+""",
+     events=[
+         ev("e1", "u1", "2026-10-01T05:29:59Z"),
+         ev("e2", "u1", "2026-10-01T05:30:00Z"),
+         ev("e3", "u3", "2026-10-01T23:59:59Z"),
+         ev("e4", "u3", "2026-10-02T00:00:00Z"),
+         ev("e5", "u2", "2026-10-17T05:29:59Z"),
+         ev("e6", "u2", "2026-10-17T05:30:00Z"),
+     ],
+     clicks=["k1,u1,c_1,2026-09-24T05:30:00Z"],
+     window=("2026-10-01T05:30:00Z", "2026-10-17T05:30:00Z"),
+     user_daily=[
+         "u1,2026-10-01,1,1,0,",
+         "u3,2026-10-01,1,2,0,",
+         "u2,2026-10-17,1,1,0,",
+     ],
+     campaign_daily=[
+         "c_1,search,2026-10-01,1,0,0,1",
+         "organic,organic,2026-10-01,1,0,0,0",
+         "organic,organic,2026-10-17,1,0,0,0",
+     ])
+
+# --------------------------------------------------------------------------- X20
+case("X20_revenue_over_i32", """\
+One person-day whose revenue passes 2^31 (O1, 64-bit sums): 216 purchases of 10,000,000 cents,
+one per minute, one session. 216 x 10,000,000 = 2,160,000,000 > 2,147,483,647. Both tables must
+hold the exact total. (An implementation with 32-bit revenue columns must fall back or widen.)
+""",
+     events=[ev(f"e{i}", "u1", at(T, i), "purchase", "p1", "10000000") for i in range(216)],
+     user_daily=["u1,2026-10-03,1,216,2160000000,shoes"],
+     campaign_daily=["organic,organic,2026-10-03,1,1,2160000000,0"])
+
+# --------------------------------------------------------------------------- X21
+case("X21_forty_categories", """\
+40 categories (cat01..cat39 and `zzz`), more than a compact category encoding may hold, plus
+product `pq`, which is missing from products.csv and so is `unknown` (E20, O3, O5).
+
+- u1: `pz` (zzz) 200 and `pq` (unknown) 200 tie; `unknown` < `zzz` byte-wise: top_category `unknown`.
+- u2: `p01` 100 and `p02` 100 tie: `cat01`.
+- u3: `p39` 150 beats `p01` 100: `cat39` (by sum, not by alphabet).
+""",
+     events=[
+         ev("e1", "u1", "2026-10-03T10:00:00Z", "purchase", "pz", "200"),
+         ev("e2", "u1", "2026-10-03T10:01:00Z", "purchase", "pq", "200"),
+         ev("e3", "u2", "2026-10-03T10:00:00Z", "purchase", "p01", "100"),
+         ev("e4", "u2", "2026-10-03T10:01:00Z", "purchase", "p02", "100"),
+         ev("e5", "u3", "2026-10-03T10:00:00Z", "purchase", "p39", "150"),
+         ev("e6", "u3", "2026-10-03T10:01:00Z", "purchase", "p01", "100"),
+     ],
+     products=[f"p{i:02d},cat{i:02d}" for i in range(1, 40)] + ["pz,zzz"],
+     user_daily=[
+         "u1,2026-10-03,1,2,400,unknown",
+         "u2,2026-10-03,1,2,200,cat01",
+         "u3,2026-10-03,1,2,250,cat39",
+     ],
+     campaign_daily=["organic,organic,2026-10-03,3,3,850,0"])
+
 # --------------------------------------------------------------------------- write
 def write(path, header, lines):
     os.makedirs(os.path.dirname(path), exist_ok=True)

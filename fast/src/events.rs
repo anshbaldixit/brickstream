@@ -12,6 +12,9 @@ use crate::links::{LinkTable, AHEAD};
 use crate::lookups::{Products, Window};
 use crate::scan::{for_each_line, LineStats};
 use crate::ts::{DayMemo, MS_PER_SECOND};
+use crate::wc::{Lines, Wc};
+
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
 /// One parsed event line (32 bytes).
 #[repr(C)]
@@ -194,7 +197,7 @@ impl EvCopy {
 /// copies are shared): one `PRec` per valid, in-time copy, by P2 partition (`hash(person)`).
 /// Dedup marks the `PRec` of every copy that loses; phase 3 reads the rest.
 pub struct EvChunk {
-    pub copies: Vec<EvCopy>,
+    pub copies: Lines<EvCopy>,
     pub coffs: Vec<u32>,
     pub eoffs: Vec<u32>,
     /// (price, category rank) of this chunk's valid purchases; `PRec::pay` is index + 1.
@@ -211,7 +214,11 @@ impl EvChunk {
 thread_local! {
     static TMP: std::cell::RefCell<(Vec<EvRec>, Vec<u16>, Vec<u16>)> =
         const { std::cell::RefCell::new((Vec::new(), Vec::new(), Vec::new())) };
+    static WC: std::cell::RefCell<(Wc<EvCopy>, Wc<PRec>)> = const { std::cell::RefCell::new((Wc::new(), Wc::new())) };
 }
+
+/// Scatter with plain stores instead of write-combining (`FAST_NO_WC=1`, for A/B runs).
+pub static PLAIN_SCATTER: AtomicBool = AtomicBool::new(false);
 
 /// Turns per-partition counts (at `i + 1`) into start offsets.
 fn prefix(counts: &mut [u32]) {
@@ -224,7 +231,7 @@ fn prefix(counts: &mut [u32]) {
 /// link-table slot is prefetched when the line is parsed and read `AHEAD` lines later, so the
 /// lookups overlap the parsing instead of stalling on memory.
 #[allow(clippy::too_many_arguments)]
-pub fn parse_chunk(parser: &EventParser, links: &LinkTable, data: &[u8], start: usize, end: usize, p1: usize, shift1: u32, p2: usize, shift2: u32) -> (EvChunk, Vec<PRec>, ParseStats) {
+pub fn parse_chunk(parser: &EventParser, links: &LinkTable, data: &[u8], start: usize, end: usize, p1: usize, shift1: u32, p2: usize, shift2: u32) -> (EvChunk, Lines<PRec>, ParseStats) {
     TMP.with(|cell| {
         let mut guard = cell.borrow_mut();
         let (tmp, ps, qs) = &mut *guard;
@@ -272,38 +279,63 @@ pub fn parse_chunk(parser: &EventParser, links: &LinkTable, data: &[u8], start: 
         assert!(st.valid < NO_EVENT, "chunk too large");
         prefix(&mut coffs);
         prefix(&mut eoffs);
-        let mut ccur: Vec<u32> = coffs[..p1].to_vec();
-        let mut ecur: Vec<u32> = eoffs[..p2].to_vec();
         let nv = eoffs[p2] as usize;
-        let mut copies: Vec<EvCopy> = Vec::with_capacity(n);
-        let mut events: Vec<PRec> = Vec::with_capacity(nv);
+        let mut copies: Lines<EvCopy> = Lines::new(n);
+        let mut events: Lines<PRec> = Lines::new(nv);
         let mut purchases: Vec<(u32, u32)> = Vec::new();
         let (cdst, edst) = (copies.as_mut_ptr(), events.as_mut_ptr());
-        for ((r, &p), &q) in tmp.iter().zip(ps.iter()).zip(qs.iter()) {
-            let at = if r.valid() {
-                let at = ecur[q as usize];
-                ecur[q as usize] += 1;
-                let pay = if r.pay & PURCHASE != 0 {
-                    purchases.push((r.pay & PRICE_MASK, r.category()));
-                    purchases.len() as u32
-                } else {
-                    0
-                };
-                // SAFETY: the cursors of all P2 partitions together cover 0..nv exactly once.
-                unsafe { edst.add(at as usize).write(PRec { person: r.user, ts: r.ts, pay }) };
-                at as u64
+        let mut pay_of = |r: &EvRec| {
+            if r.pay & PURCHASE != 0 {
+                purchases.push((r.pay & PRICE_MASK, r.category()));
+                purchases.len() as u32
             } else {
-                NO_EVENT
-            };
-            let c = ccur[p as usize];
-            ccur[p as usize] += 1;
-            // SAFETY: the cursors of all P1 partitions together cover 0..n exactly once.
-            unsafe { cdst.add(c as usize).write(EvCopy { eid: r.eid, ing_at: (r.ingest() << 24) | at }) };
+                0
+            }
+        };
+        let recs = tmp.iter().zip(ps.iter()).zip(qs.iter());
+        if !PLAIN_SCATTER.load(Relaxed) {
+            WC.with(|wc| {
+                let (wcc, wce) = &mut *wc.borrow_mut();
+                wcc.reset(&coffs);
+                wce.reset(&eoffs);
+                for ((r, &p), &q) in recs {
+                    // SAFETY: the offsets come from counting these very records, so each slot of
+                    // both outputs is put exactly once, and every partition index is in range.
+                    unsafe {
+                        let at = if r.valid() { wce.put(edst, q as usize, PRec { person: r.user, ts: r.ts, pay: pay_of(r) }) as u64 } else { NO_EVENT };
+                        wcc.put(cdst, p as usize, EvCopy { eid: r.eid, ing_at: (r.ingest() << 24) | at });
+                    }
+                }
+                // SAFETY: the destinations of the puts above.
+                unsafe {
+                    wcc.finish(cdst);
+                    wce.finish(edst);
+                }
+            });
+        } else {
+            let mut ccur: Vec<u32> = coffs[..p1].to_vec();
+            let mut ecur: Vec<u32> = eoffs[..p2].to_vec();
+            let (cdst, edst) = (cdst as *mut EvCopy, edst as *mut PRec);
+            for ((r, &p), &q) in recs {
+                let at = if r.valid() {
+                    let at = ecur[q as usize];
+                    ecur[q as usize] += 1;
+                    // SAFETY: the cursors of all P2 partitions together cover 0..nv exactly once.
+                    unsafe { edst.add(at as usize).write(PRec { person: r.user, ts: r.ts, pay: pay_of(r) }) };
+                    at as u64
+                } else {
+                    NO_EVENT
+                };
+                let c = ccur[p as usize];
+                ccur[p as usize] += 1;
+                // SAFETY: the cursors of all P1 partitions together cover 0..n exactly once.
+                unsafe { cdst.add(c as usize).write(EvCopy { eid: r.eid, ing_at: (r.ingest() << 24) | at }) };
+            }
         }
         // SAFETY: every slot of both was written above.
         unsafe {
-            copies.set_len(n);
-            events.set_len(nv);
+            copies.written();
+            events.written();
         }
         (EvChunk { copies, coffs, eoffs, purchases }, events, st)
     })

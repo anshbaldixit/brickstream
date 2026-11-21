@@ -16,9 +16,9 @@ mod lookups;
 mod output;
 mod scan;
 mod sessions;
-mod swwc;
 mod table;
 mod ts;
+mod wc;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
@@ -35,6 +35,7 @@ use crate::input::{chunks, list_csv, open, total_bytes, Input};
 use crate::lookups::{read_manifest, Campaigns, Products};
 use crate::output::CampaignRow;
 use crate::sessions::{Acc, Big, Ctx, EvSrc, Row};
+use crate::wc::Lines;
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -112,6 +113,7 @@ fn main() {
 fn run(cfg: Config) {
     let t_start = Instant::now();
     key::set_force_intern(std::env::var("FAST_FORCE_INTERN").is_ok_and(|v| v == "1"));
+    events::PLAIN_SCATTER.store(tune("NO_WC", 0) == 1, Relaxed);
     let threads = cfg.threads;
 
     // Phase 0: the small inputs, then map and chunk every CSV.
@@ -205,7 +207,7 @@ fn run(cfg: Config) {
     let unmap_threads = tune("UNMAP_THREADS", 2);
     let (ev_stats, ev_out, cl_out) = {
         let t = Instant::now();
-        let parsed: Vec<(EvChunk, Vec<PRec>, ParseStats)> = ev_chunks
+        let parsed: Vec<(EvChunk, Lines<PRec>, ParseStats)> = ev_chunks
             .par_iter()
             .map(|c| events::parse_chunk(&ev_parser, &link_table, &ev_files[c.file as usize].data, c.start, c.end, p1, shift1, p2, shift2))
             .collect();
@@ -213,7 +215,7 @@ fn run(cfg: Config) {
         for (_, _, st) in &parsed {
             ev_stats.add(*st);
         }
-        let (ev_out, ev_events): (Vec<EvChunk>, Vec<Vec<PRec>>) = parsed.into_iter().map(|(c, e, _)| (c, e)).unzip();
+        let (ev_out, ev_events): (Vec<EvChunk>, Vec<Lines<PRec>>) = parsed.into_iter().map(|(c, e, _)| (c, e)).unzip();
         input::release(ev_files, unmap_threads);
         stage!("events_parse", t, "lines" = ev_stats.lines.lines, "malformed" = ev_stats.lines.malformed,
             "empty_id" = ev_stats.empty_id, "records" = ev_stats.records, "valid_lines" = ev_stats.valid, "p1" = p1);

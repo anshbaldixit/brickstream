@@ -132,7 +132,7 @@ fn two(b: &[u8], at: usize) -> (i64, bool) {
 }
 
 /// Seconds since the epoch of the local date-time in `b[..19]` (`YYYY-MM-DDTHH:MM:SS`), checked.
-#[inline(always)]
+#[cfg(test)]
 fn local_seconds(b: &[u8]) -> Option<i64> {
     let (y1, ok1) = two(b, 0);
     let (y2, ok2) = two(b, 2);

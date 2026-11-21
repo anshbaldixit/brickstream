@@ -161,16 +161,19 @@ pub fn for_each_line<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(
 #[inline(always)]
 unsafe fn flatten<const K: usize>(dst: *mut u32, n: &mut usize, base: u32, mut m: u64) {
     let cnt = m.count_ones() as usize;
-    let d = dst.add(*n);
-    for j in 0..K {
-        *d.add(j) = base + m.trailing_zeros();
-        m &= m.wrapping_sub(1);
-    }
-    let mut j = K;
-    while j < cnt {
-        *d.add(j) = base + m.trailing_zeros();
-        m &= m.wrapping_sub(1);
-        j += 1;
+    // SAFETY: the caller's promise covers every write below.
+    unsafe {
+        let d = dst.add(*n);
+        for j in 0..K {
+            *d.add(j) = base + m.trailing_zeros();
+            m &= m.wrapping_sub(1);
+        }
+        let mut j = K;
+        while j < cnt {
+            *d.add(j) = base + m.trailing_zeros();
+            m &= m.wrapping_sub(1);
+            j += 1;
+        }
     }
     *n += cnt;
 }

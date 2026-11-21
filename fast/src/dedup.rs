@@ -13,6 +13,7 @@ use std::time::Instant;
 use crate::clicks::ClickRec;
 use crate::events::{EvChunk, EvCopy, NO_EVENT};
 use crate::key::mix;
+use crate::wc::Lines;
 
 /// One valid, in-time event in a person partition.
 #[repr(C)]
@@ -76,8 +77,8 @@ unsafe impl Sync for Marks {}
 unsafe impl Send for Marks {}
 
 impl Marks {
-    pub fn new(events: &mut [Vec<PRec>]) -> Marks {
-        Marks(events.iter_mut().map(|v| v.as_mut_ptr()).collect())
+    pub fn new(events: &mut [Lines<PRec>]) -> Marks {
+        Marks(events.iter_mut().map(|v| v.as_mut_ptr() as *mut PRec).collect())
     }
 
     #[inline(always)]

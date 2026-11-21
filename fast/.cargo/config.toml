@@ -1,0 +1,4 @@
+# AVX2 + BMI2 (pext) everywhere: the scorer's Xeon and this laptop's Ryzen both have them.
+# Not target-cpu=native: the build must also run on the laptop, which has no AVX-512.
+[build]
+rustflags = ["-C", "target-cpu=x86-64-v3"]

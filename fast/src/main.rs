@@ -1,0 +1,316 @@
+//! Shopping Sessions pipeline. Reads `$DATA_DIR`, writes `$OUTPUT_DIR/{user_daily,campaign_daily}`
+//! (or the last two arguments, DATA OUT). Stage timings go to stderr as `[fast] stage=... ms=...`.
+//!
+//! Phase 1 parses links (union-find on the side) while every event and click chunk is parsed in
+//! parallel. Phase 2 dedups events per `hash(event_id)` partition and moves events and clicks into
+//! `hash(person)` partitions. Phase 3 sessionizes each person. Phase 4 writes Parquet.
+
+mod clicks;
+mod dedup;
+mod events;
+mod input;
+mod key;
+mod links;
+mod lookups;
+mod output;
+mod scan;
+mod sessions;
+mod table;
+mod ts;
+
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::sync::Mutex;
+use std::time::Instant;
+
+use bytes::Bytes;
+use mimalloc::MiMalloc;
+use rayon::prelude::*;
+
+use crate::clicks::{ClickParser, ClickRec};
+use crate::dedup::{DedupStats, Out};
+use crate::events::{EvRec, EventParser, ParseStats};
+use crate::input::{chunks, list_csv, open, total_bytes, Input};
+use crate::lookups::{read_manifest, Campaigns, Products};
+use crate::output::CampaignRow;
+use crate::sessions::{Acc, Big, Ctx, Row};
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
+const CHUNK_BYTES: usize = 4 << 20;
+
+struct Config {
+    data: PathBuf,
+    out: PathBuf,
+    threads: usize,
+    mode: String,
+}
+
+fn config() -> Config {
+    let args: Vec<String> = std::env::args().collect();
+    let env = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
+    let (data, out) = if args.len() >= 3 {
+        (PathBuf::from(&args[args.len() - 2]), PathBuf::from(&args[args.len() - 1]))
+    } else {
+        (PathBuf::from(env("DATA_DIR", "/data")), PathBuf::from(env("OUTPUT_DIR", "/output")))
+    };
+    let threads = env("NCPU", "")
+        .parse::<usize>()
+        .ok()
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(8, |n| n.get()))
+        .min(32);
+    Config { data, out, threads, mode: env("FAST_MODE", "full") }
+}
+
+pub fn ms(t: Instant) -> f64 {
+    t.elapsed().as_secs_f64() * 1000.0
+}
+
+macro_rules! stage {
+    ($name:expr, $t:expr $(, $k:literal = $v:expr)*) => {
+        eprintln!(concat!("[fast] stage={} ms={:.1}" $(, " ", $k, "={}")*), $name, ms($t) $(, $v)*);
+    };
+}
+
+fn main() {
+    let cfg = config();
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(cfg.threads).build().unwrap();
+    // Run on a pool thread, so every parallel closure (even an inlined small one) has a thread index.
+    pool.install(|| run(cfg));
+}
+
+fn run(cfg: Config) {
+    let t_start = Instant::now();
+    key::set_force_intern(std::env::var("FAST_FORCE_INTERN").is_ok_and(|v| v == "1"));
+    let threads = cfg.threads;
+
+    // Phase 0: the small inputs, then map and chunk every CSV.
+    let t = Instant::now();
+    let window = read_manifest(&cfg.data.join("manifest.json"));
+    let (products, campaigns) =
+        rayon::join(|| Products::read(&cfg.data.join("products.csv")), || Campaigns::read(&cfg.data.join("campaigns.csv")));
+    let open_all = |dir: &str| -> Vec<Input> { list_csv(&cfg.data.join(dir)).par_iter().map(|p| open(p)).collect() };
+    let (ev_files, (cl_files, ln_files)) =
+        rayon::join(|| open_all("events"), || rayon::join(|| open_all("clicks"), || open_all("links")));
+    let ev_chunks = chunks(&ev_files, 0, CHUNK_BYTES);
+    let cl_chunks = chunks(&cl_files, 0, CHUNK_BYTES);
+    let ln_chunks = chunks(&ln_files, 0, CHUNK_BYTES);
+    let ev_bytes = total_bytes(&ev_files);
+    let cl_bytes = total_bytes(&cl_files);
+    stage!("setup", t, "threads" = threads, "event_files" = ev_files.len(), "event_bytes" = ev_bytes,
+        "click_bytes" = cl_bytes, "link_bytes" = total_bytes(&ln_files), "chunks" = ev_chunks.len() + cl_chunks.len() + ln_chunks.len());
+
+    if cfg.mode == "touch" {
+        // Baseline: read every byte once (count newlines), nothing else.
+        let t = Instant::now();
+        let all: Vec<(&[u8], usize, usize)> = ev_chunks.iter().map(|c| (&ev_files[c.file as usize].data[..], c.start, c.end))
+            .chain(cl_chunks.iter().map(|c| (&cl_files[c.file as usize].data[..], c.start, c.end)))
+            .chain(ln_chunks.iter().map(|c| (&ln_files[c.file as usize].data[..], c.start, c.end)))
+            .collect();
+        let lines: usize = all.par_iter().map(|&(d, s, e)| memchr::memchr_iter(b'\n', &d[s..e]).count()).sum();
+        stage!("touch", t, "lines" = lines);
+        stage!("total", t_start);
+        std::process::exit(0);
+    }
+
+    // Phase 1: links (table + union-find) alongside every event and click chunk.
+    let t = Instant::now();
+    let est_lines = ev_bytes / 76 + 1;
+    let p1 = (est_lines / 40_000).next_power_of_two().clamp(64, 4096);
+    let shift1 = 64 - p1.trailing_zeros();
+    let per_bucket = est_lines / p1 / threads * 5 / 4 + 16;
+    let ev_parser = EventParser { window, products: &products };
+    let cl_parser = ClickParser { window, campaigns: &campaigns };
+    let buckets: Vec<Mutex<Vec<Vec<EvRec>>>> = (0..threads)
+        .into_par_iter()
+        .map(|_| Mutex::new((0..p1).map(|_| Vec::with_capacity(per_bucket)).collect()))
+        .collect();
+    let ((link_table, link_stats), (ev_stats, mut cl_out)) = rayon::join(
+        || links::build(&ln_files, &ln_chunks),
+        || {
+            let t = Instant::now();
+            let ev_stats = ev_chunks
+                .par_iter()
+                .map(|c| {
+                    let tid = rayon::current_thread_index().unwrap();
+                    let mut b = buckets[tid].lock().unwrap();
+                    events::parse_chunk(&ev_parser, &ev_files[c.file as usize].data, c.start, c.end, &mut b, shift1)
+                })
+                .reduce(ParseStats::default, |mut a, b| {
+                    a.add(b);
+                    a
+                });
+            stage!("events_parse", t, "lines" = ev_stats.lines.lines, "malformed" = ev_stats.lines.malformed,
+                "empty_id" = ev_stats.empty_id, "records" = ev_stats.records, "valid_lines" = ev_stats.valid, "p1" = p1);
+            let t = Instant::now();
+            let cl: Vec<(Vec<ClickRec>, ParseStats)> = cl_chunks
+                .par_iter()
+                .map(|c| {
+                    let mut v = Vec::with_capacity((c.end - c.start) / 40);
+                    let st = clicks::parse_chunk(&cl_parser, &cl_files[c.file as usize].data, c.start, c.end, &mut v);
+                    (v, st)
+                })
+                .collect();
+            let mut st = ParseStats::default();
+            for (_, s) in &cl {
+                st.add(*s);
+            }
+            stage!("clicks_parse", t, "lines" = st.lines.lines, "malformed" = st.lines.malformed,
+                "empty_id" = st.empty_id, "valid" = st.valid);
+            (ev_stats, cl)
+        },
+    );
+    stage!("links", t, "lines" = link_stats.parse.lines.lines, "malformed" = link_stats.parse.lines.malformed,
+        "edges" = link_stats.edges, "ids" = link_table.ids, "persons" = link_table.persons,
+        "parse_ms" = format!("{:.1}", link_stats.ms_parse), "insert_ms" = format!("{:.1}", link_stats.ms_insert),
+        "union_ms" = format!("{:.1}", link_stats.ms_union), "names_ms" = format!("{:.1}", link_stats.ms_names));
+    stage!("phase1", t);
+    if cfg.mode == "parse" {
+        stage!("total", t_start);
+        std::process::exit(0);
+    }
+
+    // Phase 2: dedup per event_id partition, resolve persons, move to person partitions.
+    let t = Instant::now();
+    let buckets: Vec<Vec<Vec<EvRec>>> = buckets.into_iter().map(|m| m.into_inner().unwrap()).collect();
+    let n_clicks: usize = cl_out.iter().map(|(v, _)| v.len()).sum();
+    let est_ev = ev_stats.valid as usize + 1;
+    let p2 = (est_ev / 20_000).next_power_of_two().clamp(64, 2048);
+    let shift2 = 64 - p2.trailing_zeros();
+    let outs: Vec<Mutex<Out>> = (0..threads)
+        .into_par_iter()
+        .map(|_| Mutex::new(Out::new(p2, est_ev / p2 / threads * 5 / 4 + 16, n_clicks / p2 / threads * 5 / 4 + 16)))
+        .collect();
+    let dstats = (0..p1)
+        .into_par_iter()
+        .map(|p| {
+            let tid = rayon::current_thread_index().unwrap();
+            let slices: Vec<&[EvRec]> = buckets.iter().map(|b| &b[p][..]).collect();
+            dedup::partition(&slices, &link_table, &outs[tid], tid, shift2)
+        })
+        .reduce(DedupStats::default, |mut a, b| {
+            a.add(b);
+            a
+        });
+    stage!("dedup", t, "records" = dstats.records, "losers" = dstats.losers, "kept_invalid" = dstats.kept_invalid,
+        "survivors" = dstats.survivors, "purchases" = dstats.purchases, "p2" = p2);
+    let t = Instant::now();
+    cl_out.par_iter_mut().for_each(|(v, _)| {
+        let tid = rayon::current_thread_index().unwrap();
+        dedup::clicks(v, &link_table, &outs[tid], shift2);
+    });
+    let outs: Vec<Out> = outs.into_iter().map(|m| m.into_inner().unwrap()).collect();
+    stage!("clicks_resolve", t, "clicks" = n_clicks);
+    std::mem::forget(buckets);
+    std::mem::forget(cl_out);
+
+    // Phase 3: sessionize, credit and assist per person; largest partitions first.
+    let t = Instant::now();
+    let days = window.days();
+    let n_camp = campaigns.len();
+    let ctx = Ctx { window, outs: &outs, campaigns: n_camp, categories: products.categories.len(), days };
+    let mut order: Vec<(usize, usize)> = (0..p2)
+        .map(|q| (outs.iter().map(|o| o.events[q].len() + o.clicks[q].len()).sum::<usize>(), q))
+        .collect();
+    order.sort_unstable_by(|a, b| b.cmp(a));
+    let next = AtomicUsize::new(0);
+    let results: Mutex<Vec<(Vec<Row>, Vec<Acc>, Vec<Big>, u64)>> = Mutex::new(Vec::new());
+    rayon::scope(|s| {
+        for _ in 0..threads {
+            s.spawn(|_| {
+                let mut rows: Vec<Row> = Vec::with_capacity(est_ev / 8 / threads + 16);
+                let mut acc = vec![Acc::default(); (n_camp + 1) * days];
+                let mut big = Vec::new();
+                let mut sessions = 0u64;
+                loop {
+                    let i = next.fetch_add(1, Relaxed);
+                    if i >= order.len() {
+                        break;
+                    }
+                    sessions += sessions::partition(&ctx, order[i].1, &mut rows, &mut acc, &mut big);
+                }
+                results.lock().unwrap().push((rows, acc, big, sessions));
+            });
+        }
+    });
+    let results = results.into_inner().unwrap();
+    let sessions_total: u64 = results.iter().map(|r| r.3).sum();
+    let user_rows: usize = results.iter().map(|r| r.0.len()).sum();
+    stage!("sessions", t, "sessions" = sessions_total, "user_daily_rows" = user_rows);
+    let mut bigs: Vec<Big> = results.iter().flat_map(|r| r.2.iter().copied()).collect();
+    bigs.sort_unstable_by(|a, b| b.events.cmp(&a.events));
+    for b in bigs.iter().take(3) {
+        let mut name = Vec::new();
+        key::push_bytes(b.person, &mut name);
+        eprintln!("[fast] big person={} events={} clicks={} sessions={} ms={:.1}",
+            String::from_utf8_lossy(&name), b.events, b.clicks, b.sessions, b.micros as f64 / 1000.0);
+    }
+
+    // Phase 4: write both tables.
+    let t = Instant::now();
+    let mut acc = vec![Acc::default(); (n_camp + 1) * days];
+    for r in &results {
+        for (a, b) in acc.iter_mut().zip(r.1.iter()) {
+            a.sessions += b.sessions;
+            a.purchasing += b.purchasing;
+            a.revenue += b.revenue;
+            a.assisted += b.assisted;
+        }
+    }
+    let organic = Bytes::from_static(b"organic");
+    let first_day = window.first_day();
+    let mut camp_rows = Vec::new();
+    for c in 0..=n_camp {
+        let (id, channel) = if c == n_camp {
+            (organic.clone(), organic.clone())
+        } else {
+            (Bytes::from(campaigns.ids[c].clone()), Bytes::from(campaigns.channels[c].clone()))
+        };
+        for d in 0..days {
+            let a = &acc[c * days + d];
+            if a.sessions > 0 || a.assisted > 0 {
+                camp_rows.push(CampaignRow {
+                    campaign: id.clone(),
+                    channel: channel.clone(),
+                    day: (first_day + d as i64) as i32,
+                    sessions: a.sessions,
+                    purchasing: a.purchasing,
+                    revenue: a.revenue,
+                    assisted: a.assisted,
+                });
+            }
+        }
+    }
+    // Self-check (rules.md): sessions and revenue agree between the tables.
+    let user_sessions: u64 = results.iter().flat_map(|r| r.0.iter()).map(|r| r.sessions as u64).sum();
+    let user_revenue: u64 = results.iter().flat_map(|r| r.0.iter()).map(|r| r.revenue).sum();
+    let camp_sessions: u64 = camp_rows.iter().map(|r| r.sessions).sum();
+    let camp_revenue: u64 = camp_rows.iter().map(|r| r.revenue).sum();
+    if user_sessions != camp_sessions || user_revenue != camp_revenue {
+        eprintln!("[fast] SELF-CHECK FAILED sessions {user_sessions} vs {camp_sessions}, revenue {user_revenue} vs {camp_revenue}");
+    }
+    let categories: Vec<Bytes> = products.categories.iter().map(|c| Bytes::from(c.clone())).collect();
+    let ud = cfg.out.join("user_daily");
+    let cd = cfg.out.join("campaign_daily");
+    for dir in [&ud, &cd] {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            eprintln!("fast: cannot create {}: {e}", dir.display());
+            std::process::exit(3);
+        }
+    }
+    rayon::join(
+        || {
+            results.par_iter().enumerate().for_each(|(i, r)| {
+                if i == 0 || !r.0.is_empty() {
+                    output::write_user_daily(&ud.join(format!("part-{i:05}.parquet")), &r.0, &categories);
+                }
+            })
+        },
+        || output::write_campaign_daily(&cd.join("part-00000.parquet"), &camp_rows),
+    );
+    stage!("write", t, "user_daily_rows" = user_rows, "campaign_daily_rows" = camp_rows.len());
+    stage!("total", t_start);
+    std::process::exit(0);
+}

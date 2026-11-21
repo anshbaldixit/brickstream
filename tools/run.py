@@ -2,7 +2,7 @@
 """Run a Docker image the way the Shopping Sessions scorer does, and time it.
 
 Usage (from the repo root):
-  .venv/Scripts/python.exe tools/run.py IMAGE DATA OUT [--repeat N] [--cpus 8] [--mem 24g]
+  .venv/Scripts/python.exe tools/run.py IMAGE DATA OUT [--repeat N] [--cpus 8] [--mem 24g] [--env KEY=VALUE]
 
   DATA  a host folder, or vol:NAME for a Docker named volume (mounted read-only at /data)
   OUT   a host folder (emptied first; gets user_daily/ and campaign_daily/),
@@ -68,7 +68,7 @@ def parse_time(stamp):
     return dt.datetime.fromisoformat(stamp)
 
 
-def run_once(image, data, out, cpus, mem):
+def run_once(image, data, out, cpus, mem, extra_env=()):
     fresh_output(out)
     fresh_volume(SCRATCH_VOLUME)
     name = f"ss-run-{uuid.uuid4().hex[:10]}"
@@ -82,6 +82,7 @@ def run_once(image, data, out, cpus, mem):
         *mount(data, "/data", readonly=True), *mount(out, "/output"), *mount(f"vol:{SCRATCH_VOLUME}", "/scratch"),
         "-e", "DATA_DIR=/data", "-e", "OUTPUT_DIR=/output", "-e", "SCRATCH_DIR=/scratch", "-e", "HOME=/scratch",
         "-e", f"NCPU={int(float(cpus))}", "-e", f"MEM_GB={mem_gb}",
+        *[arg for pair in extra_env for arg in ("-e", pair)],
         image,
     ]
     # Container stdout goes to our stderr so callers' stdout stays clean.
@@ -100,11 +101,12 @@ def main():
     parser.add_argument("--repeat", type=int, default=1)
     parser.add_argument("--cpus", default="8")
     parser.add_argument("--mem", default="24g")
+    parser.add_argument("--env", action="append", default=[], metavar="KEY=VALUE", help="extra environment variable (repeatable)")
     args = parser.parse_args()
 
     times = []
     for attempt in range(1, args.repeat + 1):
-        code, oom, seconds = run_once(args.image, args.data, args.out, args.cpus, args.mem)
+        code, oom, seconds = run_once(args.image, args.data, args.out, args.cpus, args.mem, args.env)
         print(f"run {attempt}: exit {code}{' OOM-KILLED' if oom else ''}, {seconds:.3f} s", file=sys.stderr)
         if code != 0 or oom:
             return code or 137

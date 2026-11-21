@@ -11,8 +11,9 @@ RF=kit/starter-duckdb/starter-duckdb/scripts/run_fixtures.py
 rm -rf out/archive && mkdir -p out/archive && git archive "$REV" | tar -x -C out/archive
 docker build -q -t "$TAG" out/archive >/dev/null || { echo "BUILD FAILED"; exit 1; }
 ok=0; n=0
-for d in data/dev data/s*-1m; do
+for d in data/dev data/s*-1m data/stress-*; do
   name=$(echo "$d" | tr '/' '_')
+  [ -d "out/diff/$name/a" ] || continue   # stress sets without an oracle answer are skipped
   for mode in normal intern; do
     env=(); [ $mode = intern ] && env=(--env FAST_FORCE_INTERN=1)
     out=out/gate/$name-$mode; n=$((n+1))

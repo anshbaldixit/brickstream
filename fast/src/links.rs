@@ -6,7 +6,7 @@
 //! The same table then answers user -> person for events and clicks: a key that isn't in it is an
 //! unlinked ID, its own person.
 
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::time::Instant;
 
 use rayon::prelude::*;
@@ -99,22 +99,32 @@ impl LinkTable {
     }
 }
 
+/// The root of `x`, halving the path on the way (safe concurrently: a non-root's parent only ever
+/// moves to another of its ancestors, because trees only merge).
 #[inline(always)]
-fn find(parent: &mut [u32], mut x: u32) -> u32 {
-    while parent[x as usize] != x {
-        let grand = parent[parent[x as usize] as usize];
-        parent[x as usize] = grand;
-        x = grand;
+fn find(parent: &[AtomicU32], mut x: u32) -> u32 {
+    loop {
+        let p = parent[x as usize].load(Relaxed);
+        if p == x {
+            return x;
+        }
+        let g = parent[p as usize].load(Relaxed);
+        if g != p {
+            parent[x as usize].store(g, Relaxed);
+        }
+        x = g;
     }
-    x
 }
 
 #[inline(always)]
-fn root(parent: &[u32], mut x: u32) -> u32 {
-    while parent[x as usize] != x {
-        x = parent[x as usize];
+fn root(parent: &[AtomicU32], mut x: u32) -> u32 {
+    loop {
+        let p = parent[x as usize].load(Relaxed);
+        if p == x {
+            return x;
+        }
+        x = p;
     }
-    x
 }
 
 pub struct LinkStats {
@@ -173,24 +183,29 @@ pub fn build(files: &[Input], chunks: &[Chunk]) -> (LinkTable, LinkStats) {
     drop(parsed);
     stats.ms_insert = ms(t);
 
-    // 3. Union-find over slots; the root of a component is always its smallest key.
+    // 3. Union-find over slots, in parallel and lock-free: a root is only ever linked (by CAS on its
+    // own parent) under a root with a smaller key, so keys decrease along every path and the root of
+    // each component is its smallest key, the person's name.
     let t = Instant::now();
     let cap = table.slots.len();
-    let mut parent: Vec<u32> = (0..cap as u32).into_par_iter().collect();
+    let parent: Vec<AtomicU32> = (0..cap as u32).into_par_iter().map(AtomicU32::new).collect();
     let key = |i: u32| table.slots[i as usize].key.load(Relaxed);
-    for list in &edges {
+    edges.par_iter().for_each(|list| {
         for &(a, b) in list {
-            let ra = find(&mut parent, a);
-            let rb = find(&mut parent, b);
-            if ra != rb {
-                if cmp_ids(key(ra), key(rb)).is_lt() {
-                    parent[rb as usize] = ra;
-                } else {
-                    parent[ra as usize] = rb;
+            let (mut a, mut b) = (a, b);
+            loop {
+                a = find(&parent, a);
+                b = find(&parent, b);
+                if a == b {
+                    break;
+                }
+                let (hi, lo) = if cmp_ids(key(a), key(b)).is_lt() { (b, a) } else { (a, b) };
+                if parent[hi as usize].compare_exchange(hi, lo, Relaxed, Relaxed).is_ok() {
+                    break;
                 }
             }
         }
-    }
+    });
     drop(edges);
     stats.ms_union = ms(t);
 

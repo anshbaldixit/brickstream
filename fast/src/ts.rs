@@ -12,7 +12,7 @@ pub const MS_PER_DAY: i64 = 86_400_000;
 
 /// Days since 1970-01-01 of a proleptic Gregorian date (Howard Hinnant's days_from_civil).
 #[inline(always)]
-pub fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+pub const fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     let y = if month <= 2 { year - 1 } else { year };
     let era = y.div_euclid(400);
     let yoe = y - era * 400;
@@ -20,6 +20,91 @@ pub fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     let doy = (153 * mp + 2) / 5 + day - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     era * 146_097 + doe - 719_468
+}
+
+const TABLE_FIRST_YEAR: i64 = 1900;
+const TABLE_YEARS: usize = 300;
+
+/// `days_from_civil(y, m, 1)` for every month from 1900-01 to 2200-01 (the last entry ends 2199-12).
+static MONTH_START: [i32; TABLE_YEARS * 12 + 1] = {
+    let mut t = [0i32; TABLE_YEARS * 12 + 1];
+    let mut i = 0;
+    while i < t.len() {
+        t[i] = days_from_civil(TABLE_FIRST_YEAR + (i / 12) as i64, (i % 12) as i64 + 1, 1) as i32;
+        i += 1;
+    }
+    t
+};
+
+const ZEROS: u64 = 0x3030_3030_3030_3030;
+
+/// Every byte of `x` is an ASCII digit. (A byte outside the range can disturb the bytes after it
+/// through a carry or borrow, but then the answer is already "no".)
+#[inline(always)]
+fn all_digits(x: u64) -> bool {
+    (x.wrapping_add(0x4646_4646_4646_4646) | x.wrapping_sub(ZEROS)) & 0x8080_8080_8080_8080 == 0
+}
+
+/// Byte i of the result is `10 * d_i + d_(i+1)` for digit values `d` (two-digit numbers).
+#[inline(always)]
+fn pairs(digits: u64) -> u64 {
+    let v = digits.wrapping_sub(ZEROS);
+    v * 10 + (v >> 8)
+}
+
+/// Seconds of the checked local date-time `YYYY-MM-DDTHH:MM:SS` in `b[..19]`; `b` has at least 20
+/// bytes (byte 19 is the zone, checked by the caller). SWAR: three loads, no per-byte branches.
+#[inline(always)]
+fn civil_seconds(b: &[u8]) -> Option<i64> {
+    const SEP0_MASK: u64 = 0xFF00_00FF_0000_0000; // "YYYY-MM-": bytes 4 and 7
+    const SEP0: u64 = 0x2D00_002D_0000_0000;
+    const SEP1_MASK: u64 = 0x0000_FF00_00FF_0000; // "DDTHH:MM": bytes 2 and 5
+    const SEP1: u64 = 0x0000_3A00_0054_0000;
+    let w0 = u64::from_le_bytes(b[0..8].try_into().unwrap());
+    let w1 = u64::from_le_bytes(b[8..16].try_into().unwrap());
+    let w2 = u32::from_le_bytes(b[16..20].try_into().unwrap()) as u64; // ":SS" and the zone byte
+    if (w0 & SEP0_MASK) != SEP0 || (w1 & SEP1_MASK) != SEP1 || (w2 & 0xFF) != 0x3A {
+        return None;
+    }
+    let d0 = (w0 & !SEP0_MASK) | (ZEROS & SEP0_MASK);
+    let d1 = (w1 & !SEP1_MASK) | (ZEROS & SEP1_MASK);
+    let d2 = (w2 & 0x00FF_FF00) | (ZEROS & !0x00FF_FF00);
+    if !(all_digits(d0) & all_digits(d1) & all_digits(d2)) {
+        return None;
+    }
+    let (t0, t1, t2) = (pairs(d0), pairs(d1), pairs(d2));
+    let year = ((t0 & 0xFF) * 100 + ((t0 >> 16) & 0xFF)) as i64;
+    let month = ((t0 >> 40) & 0xFF) as i64;
+    let day = (t1 & 0xFF) as i64;
+    let hour = ((t1 >> 24) & 0xFF) as i64;
+    let minute = ((t1 >> 48) & 0xFF) as i64;
+    let second = ((t2 >> 8) & 0xFF) as i64;
+    if !(1..=12).contains(&month) || day < 1 || hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    let days = if (TABLE_FIRST_YEAR..TABLE_FIRST_YEAR + TABLE_YEARS as i64).contains(&year) {
+        let i = ((year - TABLE_FIRST_YEAR) * 12 + month - 1) as usize;
+        let first = MONTH_START[i] as i64;
+        if day > MONTH_START[i + 1] as i64 - first {
+            return None;
+        }
+        first + day - 1
+    } else {
+        if day > days_in_month(year, month) {
+            return None;
+        }
+        days_from_civil(year, month, day)
+    };
+    Some(days * 86_400 + hour * 3_600 + minute * 60 + second)
+}
+
+/// Eight ASCII digits (first in the lowest byte) as a number.
+#[inline(always)]
+fn parse8(x: u64) -> u64 {
+    let v = pairs(x);
+    (((v & 0x0000_00FF_0000_00FF).wrapping_mul(100 + (1_000_000 << 32)))
+        .wrapping_add(((v >> 16) & 0x0000_00FF_0000_00FF).wrapping_mul(1 + (10_000 << 32))))
+        >> 32
 }
 
 #[inline(always)]
@@ -76,7 +161,7 @@ pub fn parse_f1_seconds(b: &[u8]) -> Option<i64> {
     if b.len() != 20 || b[19] != b'Z' {
         return None;
     }
-    local_seconds(b)
+    civil_seconds(b)
 }
 
 #[inline(always)]
@@ -91,7 +176,7 @@ fn parse_f2_ms(b: &[u8]) -> Option<i64> {
     if !(ok_h & ok_m) || b[22] != b':' || oh > 23 || om > 59 {
         return None;
     }
-    let local = local_seconds(b)?;
+    let local = civil_seconds(b)?;
     Some((local - sign * (oh * 3_600 + om * 60)) * MS_PER_SECOND)
 }
 
@@ -99,6 +184,15 @@ fn parse_f2_ms(b: &[u8]) -> Option<i64> {
 /// window). Returns `None` if any byte is not an ASCII digit or the value is empty.
 #[inline(always)]
 fn parse_f3_ms(b: &[u8]) -> Option<i64> {
+    if b.len() == 13 {
+        // The common case: 13 digits, parsed as 8 + the last 5 (two overlapping 8-byte loads).
+        let hi = u64::from_le_bytes(b[0..8].try_into().unwrap());
+        let lo = u64::from_le_bytes(b[5..13].try_into().unwrap());
+        if !(all_digits(hi) & all_digits(lo)) {
+            return None;
+        }
+        return Some((parse8(hi) * 100_000 + parse8(lo) % 100_000) as i64);
+    }
     if b.is_empty() {
         return None;
     }
@@ -121,7 +215,7 @@ fn parse_f3_ms(b: &[u8]) -> Option<i64> {
 #[inline(always)]
 pub fn parse_ts(b: &[u8]) -> Option<i64> {
     match b.len() {
-        20 if b[19] == b'Z' => local_seconds(b).map(|s| s * MS_PER_SECOND),
+        20 if b[19] == b'Z' => civil_seconds(b).map(|s| s * MS_PER_SECOND),
         25 if b[19] == b'+' || b[19] == b'-' => parse_f2_ms(b),
         _ => parse_f3_ms(b),
     }
@@ -134,6 +228,33 @@ pub fn parse_ingest_seconds(b: &[u8]) -> Option<i64> {
     match parse_f1_seconds(b) {
         Some(s) => Some(s),
         None => parse_ts(b).map(|ms| ms.div_euclid(MS_PER_SECOND)),
+    }
+}
+
+/// The straightforward byte-by-byte parser, kept as the reference the fast paths are tested against.
+#[cfg(test)]
+pub fn parse_ts_reference(b: &[u8]) -> Option<i64> {
+    match b.len() {
+        20 if b[19] == b'Z' => local_seconds(b).map(|s| s * MS_PER_SECOND),
+        25 if b[19] == b'+' || b[19] == b'-' => {
+            let sign = if b[19] == b'+' { 1 } else { -1 };
+            let (oh, ok_h) = two(b, 20);
+            let (om, ok_m) = two(b, 23);
+            if !(ok_h & ok_m) || b[22] != b':' || oh > 23 || om > 59 {
+                return None;
+            }
+            local_seconds(b).map(|l| (l - sign * (oh * 3_600 + om * 60)) * MS_PER_SECOND)
+        }
+        _ => {
+            if b.is_empty() || b.iter().any(|c| !c.is_ascii_digit()) {
+                return None;
+            }
+            let mut v: u128 = 0;
+            for &c in b {
+                v = (v * 10 + (c - b'0') as u128).min(u64::MAX as u128 + 1);
+            }
+            Some(if v > i64::MAX as u128 { i64::MAX } else { v as i64 })
+        }
     }
 }
 
@@ -256,6 +377,27 @@ mod tests {
         assert_eq!(ms("18446745864731151616"), Some(i64::MAX));
         assert_eq!(ms("9223372036854775807"), Some(i64::MAX));
         assert_eq!(ms("9223372036854775808"), Some(i64::MAX));
+    }
+
+    #[test]
+    fn fast_paths_match_reference_on_mutations() {
+        let seeds = ["2026-10-03T23:58:10Z", "2028-02-29T00:00:00Z", "2026-10-03T19:58:10-04:00", "1791071890000", "1999-12-31T23:59:59+05:45", "2100-02-28T12:00:00Z", "1900-03-01T00:00:00Z", "2199-12-31T23:59:59Z"];
+        let alphabet: &[u8] = &[b'0', b'1', b'2', b'5', b'9', b'-', b'+', b':', b'T', b'Z', b't', b'z', b' ', b'.', 13, 0, 0xFF, b'/'];
+        let mut x: u64 = 42;
+        for _ in 0..400_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let mut s = seeds[(x % seeds.len() as u64) as usize].as_bytes().to_vec();
+            for m in 0..1 + (x >> 8) % 3 {
+                let at = ((x >> (16 + 8 * m)) % s.len() as u64) as usize;
+                s[at] = alphabet[((x >> (40 + 4 * m)) % alphabet.len() as u64) as usize];
+            }
+            assert_eq!(parse_ts(&s), parse_ts_reference(&s), "{:?}", String::from_utf8_lossy(&s));
+            if s.len() == 20 {
+                assert_eq!(parse_f1_seconds(&s).map(|v| v * 1000), if s[19] == b'Z' { parse_ts_reference(&s) } else { None });
+            }
+        }
     }
 
     #[test]

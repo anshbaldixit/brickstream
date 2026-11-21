@@ -11,7 +11,7 @@ use std::cell::RefCell;
 use std::time::Instant;
 
 use crate::clicks::ClickRec;
-use crate::dedup::{Out, PRec, SIDE_BITS};
+use crate::dedup::{ClChunk, P2Part, PRec, SIDE_BITS};
 use crate::key::{cmp_ids, mix};
 use crate::lookups::{Window, SEVEN_DAYS_MS};
 use crate::ts::MS_PER_DAY;
@@ -38,7 +38,6 @@ pub struct Acc {
     pub sessions: u64,
     pub purchasing: u64,
     pub revenue: u64,
-    pub assisted: u64,
 }
 
 /// A person whose work is worth logging.
@@ -66,6 +65,8 @@ struct Scratch {
     counts: Vec<u32>,
     ccounts: Vec<u32>,
     of_event: Vec<u32>,
+    /// `ts << 32 | pay` of each event in read order, so the scatter doesn't read the input again.
+    tsp: Vec<u64>,
     of_click: Vec<u32>,
     evs: Vec<u64>,
     cls: Vec<Cl>,
@@ -82,7 +83,8 @@ thread_local! {
 
 pub struct Ctx<'a> {
     pub window: Window,
-    pub outs: &'a [Out],
+    pub parts: &'a [P2Part],
+    pub clicks: &'a [ClChunk],
     pub campaigns: usize,
     pub categories: usize,
     pub days: usize,
@@ -92,15 +94,17 @@ impl Ctx<'_> {
     #[inline(always)]
     fn purchase(&self, pay: u32) -> (u32, u32) {
         let v = pay - 1;
-        self.outs[(v >> SIDE_BITS) as usize].purchases[(v & ((1 << SIDE_BITS) - 1)) as usize]
+        self.parts[(v >> SIDE_BITS) as usize].purchases[(v & ((1 << SIDE_BITS) - 1)) as usize]
     }
 }
 
 /// Sessionizes P2 partition `q`. Appends user_daily rows to `rows` and campaign counters to `acc`
 /// (indexed `campaign * days + day_index`, organic = `campaigns`).
-pub fn partition(ctx: &Ctx, q: usize, rows: &mut Vec<Row>, acc: &mut [Acc], big: &mut Vec<Big>) -> u64 {
-    let ev_slices: Vec<&[PRec]> = ctx.outs.iter().map(|o| &o.events[q][..]).collect();
-    let cl_slices: Vec<&[ClickRec]> = ctx.outs.iter().map(|o| &o.clicks[q][..]).collect();
+/// `assisted` is kept apart from `acc`: assists are the most frequent update (often more than ten per
+/// session), and a compact u32 array stays in L2.
+pub fn partition(ctx: &Ctx, q: usize, rows: &mut Vec<Row>, acc: &mut [Acc], assisted: &mut [u32], big: &mut Vec<Big>) -> u64 {
+    let ev_slices: Vec<&[PRec]> = ctx.parts.iter().map(|pp| pp.part(q)).filter(|s| !s.is_empty()).collect();
+    let cl_slices: Vec<&[ClickRec]> = ctx.clicks.iter().map(|c| c.part(q)).filter(|s| !s.is_empty()).collect();
     let n: usize = ev_slices.iter().map(|s| s.len()).sum();
     if n == 0 {
         return 0;
@@ -110,8 +114,10 @@ pub fn partition(ctx: &Ctx, q: usize, rows: &mut Vec<Row>, acc: &mut [Acc], big:
         let mut guard = cell.borrow_mut();
         let sc = &mut *guard;
         // 1. Local person index for every event, and event counts per person.
-        let cap = (2 * n).next_power_of_two().max(64);
-        let mask = cap - 1;
+        // Sized for the persons, not the events (a partition has ~10x more events than persons), and
+        // doubled when half full, so the map stays small enough for L1/L2.
+        let mut cap = (n / 8).next_power_of_two().max(256);
+        let mut mask = cap - 1;
         sc.keys.clear();
         sc.keys.resize(cap, 0);
         sc.slot.resize(cap, 0);
@@ -119,6 +125,8 @@ pub fn partition(ctx: &Ctx, q: usize, rows: &mut Vec<Row>, acc: &mut [Acc], big:
         sc.counts.clear();
         sc.of_event.clear();
         sc.of_event.reserve(n);
+        sc.tsp.clear();
+        sc.tsp.reserve(n);
         for s in &ev_slices {
             for r in s.iter() {
                 let mut h = mix(r.person) as usize & mask;
@@ -133,12 +141,28 @@ pub fn partition(ctx: &Ctx, q: usize, rows: &mut Vec<Row>, acc: &mut [Acc], big:
                         sc.slot[h] = idx;
                         sc.persons.push(r.person);
                         sc.counts.push(0);
+                        if sc.persons.len() * 2 > cap {
+                            cap *= 2;
+                            mask = cap - 1;
+                            sc.keys.clear();
+                            sc.keys.resize(cap, 0);
+                            sc.slot.resize(cap, 0);
+                            for (i, &k) in sc.persons.iter().enumerate() {
+                                let mut g = mix(k) as usize & mask;
+                                while sc.keys[g] != 0 {
+                                    g = (g + 1) & mask;
+                                }
+                                sc.keys[g] = k;
+                                sc.slot[g] = i as u32;
+                            }
+                        }
                         break idx;
                     }
                     h = (h + 1) & mask;
                 };
                 sc.counts[idx as usize] += 1;
                 sc.of_event.push(idx);
+                sc.tsp.push(((r.ts as u64) << 32) | r.pay as u64);
             }
         }
         let m = sc.persons.len();
@@ -175,15 +199,10 @@ pub fn partition(ctx: &Ctx, q: usize, rows: &mut Vec<Row>, acc: &mut [Acc], big:
         }
         sc.evs.clear();
         sc.evs.resize(n, 0);
-        let mut e = 0;
-        for s in &ev_slices {
-            for r in s.iter() {
-                let idx = sc.of_event[e] as usize;
-                e += 1;
-                let at = sc.counts[idx] as usize;
-                sc.counts[idx] += 1;
-                sc.evs[at] = ((r.ts as u64) << 32) | r.pay as u64;
-            }
+        for (&idx, &tsp) in sc.of_event.iter().zip(sc.tsp.iter()) {
+            let at = sc.counts[idx as usize] as usize;
+            sc.counts[idx as usize] += 1;
+            sc.evs[at] = tsp;
         }
         let mut coff = 0u32;
         for c in sc.ccounts.iter_mut() {
@@ -215,7 +234,7 @@ pub fn partition(ctx: &Ctx, q: usize, rows: &mut Vec<Row>, acc: &mut [Acc], big:
             let (ev_end, cl_end) = (sc.counts[i] as usize, sc.ccounts[i] as usize);
             let t = (ev_end - ev_start > 20_000).then(Instant::now);
             let who = sc.persons[i];
-            let s = person(ctx, sc, who, ev_start, ev_end, cl_start, cl_end, rows, acc);
+            let s = person(ctx, sc, who, ev_start, ev_end, cl_start, cl_end, rows, acc, assisted);
             sessions_total += s;
             if let Some(t) = t {
                 big.push(Big {
@@ -245,6 +264,7 @@ fn person(
     c1: usize,
     rows: &mut Vec<Row>,
     acc: &mut [Acc],
+    assisted: &mut [u32],
 ) -> u64 {
     let evs = &mut sc.evs[e0..e1];
     evs.sort_unstable();
@@ -324,7 +344,7 @@ fn person(
         a.purchasing += purchased as u64;
         a.revenue += revenue;
         for &c in &sc.present {
-            acc[c as usize * days + d].assisted += 1;
+            assisted[c as usize * days + d] += 1;
         }
         sessions += 1;
         i = j;

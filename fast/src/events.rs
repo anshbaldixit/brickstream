@@ -97,9 +97,20 @@ impl EventParser<'_> {
                 0
             }
         };
+        // Event type by length and one integer compare (no memcmp calls).
         let ty = f[4];
-        let purchase = ty == b"purchase";
-        if !(purchase || ty == b"view" || ty == b"cart") {
+        let (known, purchase) = match ty.len() {
+            4 => {
+                let w = u32::from_le_bytes(ty[..4].try_into().unwrap());
+                (w == u32::from_le_bytes(*b"view") || w == u32::from_le_bytes(*b"cart"), false)
+            }
+            8 => {
+                let p = u64::from_le_bytes(ty[..8].try_into().unwrap()) == u64::from_le_bytes(*b"purchase");
+                (p, p)
+            }
+            _ => (false, false),
+        };
+        if !known {
             valid = false;
         }
         let mut price = 0u32;
@@ -152,26 +163,61 @@ impl ParseStats {
     }
 }
 
-/// Parses `data[start..end]` into `buckets`, partitioned by the top bits of `hash(event_id)`.
-pub fn parse_chunk(
-    parser: &EventParser,
-    data: &[u8],
-    start: usize,
-    end: usize,
-    buckets: &mut [Vec<EvRec>],
-    shift: u32,
-) -> ParseStats {
-    let mut st = ParseStats::default();
-    st.lines = for_each_line::<7, _>(data, start, end, |f| match parser.parse(f) {
-        Some(rec) => {
-            st.records += 1;
-            st.valid += rec.valid() as u64;
-            let p = (mix(rec.eid) >> shift) as usize;
-            buckets[p].push(rec);
+/// One chunk's records, counting-sorted by P1 partition: partition `p` is `recs[offs[p]..offs[p + 1]]`.
+pub struct EvChunk {
+    pub recs: Vec<EvRec>,
+    pub offs: Vec<u32>,
+}
+
+impl EvChunk {
+    #[inline(always)]
+    pub fn part(&self, p: usize) -> &[EvRec] {
+        &self.recs[self.offs[p] as usize..self.offs[p + 1] as usize]
+    }
+}
+
+thread_local! {
+    static TMP: std::cell::RefCell<(Vec<EvRec>, Vec<u16>)> = const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+}
+
+/// Parses `data[start..end]`: records are written sequentially, then counting-sorted by the top bits
+/// of `hash(event_id)` into the chunk's own buffer.
+pub fn parse_chunk(parser: &EventParser, data: &[u8], start: usize, end: usize, p1: usize, shift: u32) -> (EvChunk, ParseStats) {
+    TMP.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        let (tmp, parts) = &mut *guard;
+        tmp.clear();
+        parts.clear();
+        let mut offs = vec![0u32; p1 + 1];
+        let mut st = ParseStats::default();
+        st.lines = for_each_line::<7, _>(data, start, end, |f| match parser.parse(f) {
+            Some(rec) => {
+                st.records += 1;
+                st.valid += rec.valid() as u64;
+                let p = (mix(rec.eid) >> shift) as usize;
+                offs[p + 1] += 1;
+                tmp.push(rec);
+                parts.push(p as u16);
+            }
+            None => st.empty_id += 1,
+        });
+        for i in 0..p1 {
+            offs[i + 1] += offs[i];
         }
-        None => st.empty_id += 1,
-    });
-    st
+        let mut cursor: Vec<u32> = offs[..p1].to_vec();
+        let n = tmp.len();
+        let mut recs: Vec<EvRec> = Vec::with_capacity(n);
+        let dst = recs.as_mut_ptr();
+        for (rec, &p) in tmp.iter().zip(parts.iter()) {
+            let at = cursor[p as usize] as usize;
+            cursor[p as usize] += 1;
+            // SAFETY: the cursors of all partitions together cover 0..n exactly once.
+            unsafe { dst.add(at).write(*rec) };
+        }
+        // SAFETY: every slot in 0..n was written above.
+        unsafe { recs.set_len(n) };
+        (EvChunk { recs, offs }, st)
+    })
 }
 
 #[cfg(test)]

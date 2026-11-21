@@ -1,0 +1,111 @@
+# candidates: space-separated "<40-hex sha>" or "<sha>@K=V,K2=V2" (same image, different env knobs).
+# The first candidate is the gold reference: every other run's output must equal its output exactly.
+name: bench
+run-name: bench ${{ inputs.label }}
+on:
+  workflow_dispatch:
+    inputs:
+      label:
+        description: Short name for this comparison
+        required: true
+      candidates:
+        description: 'Space-separated shas, e.g. "abc...40 def...40@XL_RD=1"'
+        required: true
+      rounds:
+        description: Measured repeats per size (3-9)
+        default: '5'
+      sizes:
+        description: 's3 = 20M events, s4 = 60M events'
+        default: 's3 s4'
+permissions:
+  contents: read
+jobs:
+  bench:
+    runs-on: ubuntu-24.04            # public repos: 4 vCPU, 16 GB RAM; the CPU model varies per job
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        replica: [1, 2, 3]           # jobs land on different hosts; non-AVX-512 ones skip themselves
+    env:
+      WORK: ${{ github.workspace }}/.work
+      KIT: https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files
+      CANDIDATES: ${{ inputs.candidates }}
+      ROUNDS: ${{ inputs.rounds }}
+      SIZES: ${{ inputs.sizes }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require an AVX-512 host
+        id: cpu
+        run: |
+          lscpu
+          if grep -qw avx512bw /proc/cpuinfo && grep -qw avx512vl /proc/cpuinfo; then echo capable=yes >> "$GITHUB_OUTPUT"; else echo capable=no >> "$GITHUB_OUTPUT"; fi
+      - name: Build every candidate within the 10-minute build limit
+        if: steps.cpu.outputs.capable == 'yes'
+        run: |
+          set -eu
+          mkdir -p "$WORK"
+          python3 - <<'PYTHON'
+          import json, os, re, subprocess, time
+          from pathlib import Path
+          run = lambda *a, **k: subprocess.run(a, check=True, **k)
+          variants, built = {}, {}
+          for tok in os.environ["CANDIDATES"].split():
+              sha, _, envs = tok.partition("@")
+              assert re.fullmatch(r"[0-9a-f]{40}", sha), tok
+              env = dict(kv.split("=", 1) for kv in envs.split(",") if kv)
+              if sha not in built:
+                  tree = Path(os.environ["RUNNER_TEMP"]) / ("t-" + sha[:12])
+                  run("git", "worktree", "add", "--detach", str(tree), sha)
+                  tag = "i-" + sha[:12]
+                  t = time.perf_counter()
+                  # Build context = the commit's repo root, with the submission Dockerfile at its top.
+                  run("docker", "build", "--platform", "linux/amd64", "-t", tag, str(tree), timeout=600)
+                  print(f"BUILD {tag} {time.perf_counter() - t:.0f}s", flush=True)
+                  built[sha] = tag
+              name = built[sha] + ("@" + envs if envs else "")
+              assert name not in variants, "duplicate candidate " + name
+              variants[name] = {"image": built[sha], "env": env}
+          assert 2 <= len(variants) <= 10
+          (Path(os.environ["WORK"]) / "images.json").write_text(json.dumps(variants))
+          PYTHON
+      - name: Get the organizers' kit and build the generator
+        if: steps.cpu.outputs.capable == 'yes'
+        run: |
+          set -eu
+          cd "$WORK"
+          for kit in generator starter-duckdb dev-answer; do
+            curl -fsSL --retry 3 "$KIT/$kit.zip" -o "$kit.zip"
+            unzip -q "$kit.zip"
+          done
+          cargo build --offline --release --manifest-path generator/Cargo.toml
+          python3 -m venv venv
+          venv/bin/pip install -q polars==2.1.0
+          generator/target/release/generate --seed 1 --events 1000000 --clicks 250000 --output dev
+          case " $SIZES " in *" s3 "*) generator/target/release/generate --seed 3 --events 20000000 --clicks 5000000 --output s3;; esac
+          case " $SIZES " in *" s4 "*) generator/target/release/generate --seed 4 --events 60000000 --clicks 15000000 --output s4;; esac
+          df -h . | tail -1
+      - name: Check every candidate on the 36 fixtures and the dev answer
+        if: steps.cpu.outputs.capable == 'yes'
+        run: |
+          set -eu
+          export CPUS="$(nproc)" MEM=12g
+          for IMAGE in $(jq -r '.[].image' "$WORK/images.json" | sort -u); do
+            export IMAGE
+            sudo env CPUS="$CPUS" MEM="$MEM" IMAGE="$IMAGE" "$WORK/venv/bin/python" "$WORK/starter-duckdb/scripts/run_fixtures.py" "$WORK/starter-duckdb/fixtures" -- sh "$WORK/starter-duckdb/scripts/docker_run.sh"
+            sh "$WORK/starter-duckdb/scripts/docker_run.sh" "$WORK/dev" "$WORK/dev-out-$IMAGE"
+            "$WORK/venv/bin/python" "$WORK/starter-duckdb/scripts/compare.py" "$WORK/dev-out-$IMAGE" "$WORK/dev-answer"
+          done
+      - name: Time the full containers and compare both tables on every run
+        if: steps.cpu.outputs.capable == 'yes'
+        run: sudo env WORK="$WORK" ROUNDS="$ROUNDS" SIZES="$SIZES" "$WORK/venv/bin/python" .github/scripts/frontier.py
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.cpu.outputs.capable == 'yes'
+        with:
+          name: timings-${{ matrix.replica }}
+          path: .work/result.json
+          include-hidden-files: true
+          if-no-files-found: warn

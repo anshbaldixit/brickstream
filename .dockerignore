@@ -1,0 +1,11 @@
+.git
+.venv
+kit
+data
+out
+**/target
+docs
+tests
+bench
+tools
+*.md

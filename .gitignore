@@ -1,0 +1,7 @@
+kit/
+data/
+out/
+.venv/
+**/target/
+__pycache__/
+*.pyc

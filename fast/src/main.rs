@@ -86,18 +86,19 @@ pub fn ms(t: Instant) -> f64 {
     t.elapsed().as_secs_f64() * 1000.0
 }
 
-/// Minor page faults and system CPU ms so far, for the stage log.
-fn faults() -> (u64, u64) {
+/// Minor page faults, system CPU ms and total CPU ms so far, for the stage log.
+fn faults() -> (u64, u64, u64) {
     // SAFETY: getrusage only writes the struct we pass.
     let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
     unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
-    (ru.ru_minflt as u64, ru.ru_stime.tv_sec as u64 * 1000 + ru.ru_stime.tv_usec as u64 / 1000)
+    let ms = |t: libc::timeval| t.tv_sec as u64 * 1000 + t.tv_usec as u64 / 1000;
+    (ru.ru_minflt as u64, ms(ru.ru_stime), ms(ru.ru_stime) + ms(ru.ru_utime))
 }
 
 macro_rules! stage {
     ($name:expr, $t:expr $(, $k:literal = $v:expr)*) => {{
-        let (flt, sys) = faults();
-        eprintln!(concat!("[fast] stage={} ms={:.1}" $(, " ", $k, "={}")*, " minflt={} sys_ms={}"), $name, ms($t) $(, $v)*, flt, sys);
+        let (flt, sys, cpu) = faults();
+        eprintln!(concat!("[fast] stage={} ms={:.1}" $(, " ", $k, "={}")*, " minflt={} sys_ms={} cpu_now={}"), $name, ms($t) $(, $v)*, flt, sys, cpu);
     }};
 }
 

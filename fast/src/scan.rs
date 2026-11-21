@@ -89,34 +89,33 @@ fn masks64(block: &[u8; 64]) -> (u64, u64, u64) {
 const MAX_FIELDS: usize = 16;
 /// Bytes per window. Every window ends at a line end, so no line spans two windows.
 const WINDOW: usize = 16 * 1024;
-const NL: u32 = 1 << 31;
+/// Room for a window's positions: at most 64 per block, one block past the window (a missing
+/// final `\n`), up to 8 unconditional writes past the count, and the sentinels.
+const SLOTS: usize = WINDOW + 256;
 
 /// Per-thread buffers for one window's structural index.
 struct Scratch {
-    /// Offsets of the window's separators (`,` and `\n`), `NL` set on newlines.
-    pos: Vec<u32>,
-    /// Quote bitmask of each 64-byte block, and the number of quotes before it.
-    qm: Vec<u64>,
-    qpre: Vec<u32>,
+    /// Offsets of field starts (one past the opening quote of a quoted field), in order.
+    starts: Vec<u32>,
+    /// Offsets of line ends: each `\n`, and the end of a file's last line if it has none.
+    ends: Vec<u32>,
+    /// Offsets where quoting breaks the dialect; a line holding one is malformed.
+    bads: Vec<u32>,
 }
 
 thread_local! {
-    static SCRATCH: RefCell<Scratch> = RefCell::new(Scratch {
-        pos: vec![0; WINDOW + 128],
-        qm: vec![0; WINDOW / 64 + 2],
-        qpre: vec![0; WINDOW / 64 + 2],
-    });
+    static SCRATCH: RefCell<Scratch> =
+        RefCell::new(Scratch { starts: vec![0; SLOTS], ends: vec![0; SLOTS], bads: vec![0; SLOTS] });
 }
 
 /// Calls `f` with the N unquoted values of every well-formed line in `buf[start..end]`.
 /// `start` must be a line start and `end` a line end (just after a `\n`, or the end of the file).
 ///
-/// The bytes are processed in windows of whole lines. Pass A builds the window's structural index:
-/// AVX2 compares give `\n`, `,` and `"` bitmasks per 64 bytes, separator positions are flattened from
-/// the masks almost without branches, and quote counts are kept per block. Pass B walks the lines:
-/// a line is well-formed iff its first N-1 separators are commas and the N-th is its newline, and its
-/// quote count (from the per-block prefix counts) equals twice the number of its fields that are at
-/// least 2 bytes long and start and end with `"` (those quotes are then exactly the brackets).
+/// The bytes are processed in windows of whole lines; lines longer than a window go through
+/// `split_line`. Pass A builds a window's structural index from AVX2 bitmasks of `\n`, `,` and `"`
+/// per 64 bytes: field starts, line ends and quoting errors, each as a list of offsets. Pass B
+/// walks the lines: a line is well-formed iff exactly N field starts precede its end and no quoting
+/// error lies in it; its fields then follow from the starts alone.
 pub fn for_each_line<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(
     buf: &'a [u8],
     start: usize,
@@ -155,6 +154,27 @@ pub fn for_each_line<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(
     stats
 }
 
+/// Writes `base + i` for each set bit `i` of `m` at `dst[*n..]`, the first `K` unconditionally
+/// (entries past the count are overwritten later), and advances `*n` by the count.
+///
+/// SAFETY: `dst` must have room for `*n + max(K, popcount(m))` entries.
+#[inline(always)]
+unsafe fn flatten<const K: usize>(dst: *mut u32, n: &mut usize, base: u32, mut m: u64) {
+    let cnt = m.count_ones() as usize;
+    let d = dst.add(*n);
+    for j in 0..K {
+        *d.add(j) = base + m.trailing_zeros();
+        m &= m.wrapping_sub(1);
+    }
+    let mut j = K;
+    while j < cnt {
+        *d.add(j) = base + m.trailing_zeros();
+        m &= m.wrapping_sub(1);
+        j += 1;
+    }
+    *n += cnt;
+}
+
 #[inline(always)]
 fn window<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(
     buf: &'a [u8],
@@ -166,10 +186,21 @@ fn window<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(
 ) {
     let w: &'a [u8] = &buf[ws..we];
     let wlen = w.len();
-    let nblocks = wlen.div_ceil(64);
-    // Pass A: the structural index.
-    let mut npos = 0usize;
-    let mut quotes = 0u32;
+    // A file's last line may lack its `\n`: a virtual one at `wlen` ends it.
+    let open_end = w[wlen - 1] != b'\n';
+    let nblocks = (wlen + open_end as usize).div_ceil(64);
+    debug_assert!(64 * nblocks + 64 + MAX_FIELDS + 1 <= SLOTS);
+
+    // Pass A. Per block, with `sep` = commas and line ends and `first` = a field's first byte:
+    // a quote at a field's first byte opens the field, any other quote must close it. So every
+    // other quote must be followed by a separator, an opening quote must not be, and a field's
+    // separator must follow a quote exactly when the field opened with one. The last test carries
+    // each opening quote to its field's separator with one addition (the carry ripples through the
+    // field's non-separator bytes). Together that is the rules' dialect: a field either holds no
+    // quote, or is at least 2 bytes that start and end with `"` and hold no other `"`.
+    let (mut ns, mut ne, mut nb) = (0usize, 0usize, 0usize);
+    let (mut prev_sep, mut prev_open, mut prev_other, mut carry) = (1u64, 0u64, 0u64, 0u64);
+    let (ps, pe, pb) = (sc.starts.as_mut_ptr(), sc.ends.as_mut_ptr(), sc.bads.as_mut_ptr());
     let mut pad = [0u8; 64];
     for b in 0..nblocks {
         let p = ws + 64 * b;
@@ -188,128 +219,83 @@ fn window<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(
             nl &= keep;
             cm &= keep;
             qt &= keep;
+            nl |= (open_end as u64) << rem;
         }
-        // SAFETY: b < nblocks <= WINDOW / 64 + 1 < qm.len() == qpre.len().
-        unsafe {
-            *sc.qm.get_unchecked_mut(b) = qt;
-            *sc.qpre.get_unchecked_mut(b) = quotes;
-        }
-        quotes += qt.count_ones();
-        let mut seps = nl | cm;
-        let cnt = seps.count_ones() as usize;
+        let sep = nl | cm;
+        let first = (sep << 1) | prev_sep;
+        let open = qt & first;
+        let other = qt & !first;
+        let after_open = (open << 1) | prev_open;
+        let after_other = (other << 1) | prev_other;
+        let (s, k1) = (!sep).overflowing_add(open);
+        let (opened, k2) = s.overflowing_add(carry);
+        let bad = (after_other & !sep) | (after_open & sep) | ((opened ^ (after_other | after_open)) & sep);
+        let starts = (first & !qt) | after_open;
+        carry = (k1 | k2) as u64;
+        prev_sep = sep >> 63;
+        prev_open = open >> 63;
+        prev_other = other >> 63;
         let base = (64 * b) as u32;
-        debug_assert!(npos + 64 <= sc.pos.len());
-        // SAFETY: npos <= 64 * b and pos has WINDOW + 128 entries, so npos + 64 is in bounds.
+        // SAFETY: each list gets at most 64 entries per block (and at most 8 written past its
+        // count), so all writes stay below 64 * nblocks + 64 <= SLOTS.
         unsafe {
-            let dst = sc.pos.as_mut_ptr().add(npos);
-            // Eight positions unconditionally (most blocks have fewer), the rest in a rare loop.
-            for j in 0..8 {
-                let tz = seps.trailing_zeros() & 63;
-                *dst.add(j) = (base + tz) | ((((nl >> tz) & 1) as u32) << 31);
-                seps &= seps.wrapping_sub(1);
-            }
-            let mut j = 8;
-            while j < cnt {
-                let tz = seps.trailing_zeros();
-                *dst.add(j) = (base + tz) | ((((nl >> tz) & 1) as u32) << 31);
-                seps &= seps.wrapping_sub(1);
-                j += 1;
+            flatten::<8>(ps, &mut ns, base, starts);
+            flatten::<2>(pe, &mut ne, base, nl);
+            if bad != 0 {
+                flatten::<0>(pb, &mut nb, base, bad);
             }
         }
-        npos += cnt;
     }
-    sc.qm[nblocks] = 0;
-    sc.qpre[nblocks] = quotes;
-    let (qm, qpre) = (&sc.qm, &sc.qpre);
-    let qcount = |p: u32| -> u32 {
-        let b = (p >> 6) as usize;
-        debug_assert!(b <= nblocks);
-        // SAFETY: p <= wlen, so b <= nblocks, and entries 0..=nblocks were written above.
-        unsafe { qpre.get_unchecked(b) + (qm.get_unchecked(b) & ((1u64 << (p & 63)) - 1)).count_ones() }
-    };
-    // Pass B: the lines.
-    let pos = &sc.pos[..npos];
-    let mut k = 0usize;
-    let mut ls = 0u32;
-    while k < npos {
-        if k + N <= npos {
-            let mut early = 0u32;
-            // SAFETY: k + N <= npos.
-            let last = unsafe {
-                for i in 0..N - 1 {
-                    early |= *pos.get_unchecked(k + i);
-                }
-                *pos.get_unchecked(k + N - 1)
-            };
-            if early & NL == 0 && last & NL != 0 {
-                let le = last & !NL;
-                stats.lines += 1;
-                // SAFETY: k + N - 1 < npos.
-                emit::<N, F>(w, ls, unsafe { pos.get_unchecked(k..k + N - 1) }, le, qcount(le) - qcount(ls), f, stats);
-                ls = le + 1;
-                k += N;
-                continue;
+    // Sentinels: pass B reads up to N starts past the last one consumed, and one bad.
+    sc.starts[ns..ns + N + 1].fill(u32::MAX);
+    sc.bads[nb] = u32::MAX;
+
+    // Pass B. Invariants: every start before `starts[k]` and every bad before `bads[bi]` lies in an
+    // earlier line, so `starts[k] >= ls`; and `k <= ns`, `bi <= nb` (the sentinels stop both).
+    let (starts, bads) = (&sc.starts[..ns + N + 1], &sc.bads[..nb + 1]);
+    let (mut k, mut bi, mut ls) = (0usize, 0usize, 0u32);
+    // SAFETY (every unchecked access below): `k + N <= ns + N < starts.len()` and
+    // `bi < bads.len()` by the invariants.
+    let start = |i: usize| unsafe { *starts.get_unchecked(i) };
+    for &le in &sc.ends[..ne] {
+        stats.lines += 1;
+        // Exactly N field starts in [ls, le] and no quoting error: well-formed.
+        if start(k + N - 1) <= le && start(k + N) > le && unsafe { *bads.get_unchecked(bi) } > le {
+            let mut fields: [&[u8]; N] = [&[]; N];
+            // A quoted field's start is one past its opening quote; its content ends one before
+            // its separator, which is one before the next field's start (two if that is quoted).
+            // The first field's start is `ls` or, quoted, `ls + 1`.
+            let mut a = start(k);
+            let mut q = a - ls;
+            for (i, field) in fields.iter_mut().enumerate() {
+                let (sep, next, qn) = if i + 1 < N {
+                    let next = start(k + i + 1);
+                    // SAFETY: ls <= a < next <= le < wlen + 1, so next - 1 is inside `w`.
+                    let qn = (unsafe { *w.get_unchecked(next as usize - 1) } == b'"') as u32;
+                    (next - 1 - qn, next, qn)
+                } else {
+                    (le, 0, 0)
+                };
+                debug_assert!(a <= sep - q && sep as usize <= wlen);
+                // SAFETY: a <= sep - q (a quoted field holds at least its two quotes: a lone `"`
+                // is a quoting error) and sep <= le <= wlen.
+                *field = unsafe { w.get_unchecked(a as usize..(sep - q) as usize) };
+                a = next;
+                q = qn;
             }
-        }
-        // Not N-1 commas and then a newline: skip to this line's newline.
-        let mut kn = k;
-        while kn < npos && pos[kn] & NL == 0 {
-            kn += 1;
-        }
-        if kn == npos {
-            break; // the file's last line has no `\n`
-        }
-        stats.lines += 1;
-        stats.malformed += 1;
-        ls = (pos[kn] & !NL) + 1;
-        k = kn + 1;
-    }
-    if (ls as usize) < wlen {
-        // The file's last line without a trailing `\n`: its separators are pos[k..], all commas.
-        stats.lines += 1;
-        if npos - k == N - 1 {
-            emit::<N, F>(w, ls, &pos[k..npos], wlen as u32, qcount(wlen as u32) - qcount(ls), f, stats);
+            f(&fields);
+            k += N;
         } else {
             stats.malformed += 1;
+            while start(k) <= le {
+                k += 1;
+            }
+            while unsafe { *bads.get_unchecked(bi) } <= le {
+                bi += 1;
+            }
         }
+        ls = le + 1;
     }
-}
-
-#[inline(always)]
-fn emit<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(
-    w: &'a [u8],
-    ls: u32,
-    commas: &[u32],
-    le: u32,
-    quotes: u32,
-    f: &mut F,
-    stats: &mut LineStats,
-) {
-    debug_assert!(commas.len() == N - 1);
-    let mut fields: [&[u8]; N] = [&[]; N];
-    let mut s = ls as usize;
-    // SAFETY: the separators are increasing offsets inside the window and le <= w.len(), so every
-    // range s..e below is inside w (s is one past the previous separator, at most e).
-    // Branch-free bracket check (a fifth of all fields are quoted, at random): a field of at least
-    // 2 bytes that starts and ends with `"` loses one byte at each end.
-    let last = w.len() - 1;
-    let mut bracketed = 0u32;
-    for (i, field) in fields.iter_mut().enumerate() {
-        let e = if i + 1 < N { unsafe { *commas.get_unchecked(i) as usize } } else { le as usize };
-        debug_assert!(s <= e && e <= w.len() && !w.is_empty());
-        // SAFETY: both indexes are clamped into the window (non-empty: it holds this line).
-        let (first, final_) = unsafe { (*w.get_unchecked(s.min(last)), *w.get_unchecked(e.saturating_sub(1).min(last))) };
-        let q = ((e >= s + 2) & (first == b'"') & (final_ == b'"')) as usize;
-        bracketed += q as u32;
-        // SAFETY: s + q <= e - q <= w.len() (q = 1 only if e >= s + 2).
-        *field = unsafe { w.get_unchecked(s + q..e - q) };
-        s = e + 1;
-    }
-    if quotes != 2 * bracketed {
-        stats.malformed += 1;
-        return;
-    }
-    f(&fields);
 }
 
 #[cfg(test)]
@@ -428,6 +414,35 @@ mod tests {
             assert_eq!(got, want, "round {round}");
             assert_eq!(stats.malformed, malformed, "round {round}");
         }
+    }
+
+    /// Text from a tiny alphabet, so quotes, separators and empty fields and lines meet in every
+    /// combination, including across 64-byte blocks.
+    fn dense_text(r: &mut Rng, bytes: usize) -> Vec<u8> {
+        (0..bytes).map(|_| [b'"', b'"', b',', b',', b'a', b'\n', b'\r'][r.below(7) as usize]).collect()
+    }
+
+    fn check_dense<const N: usize>(r: &mut Rng) {
+        for round in 0..400 {
+            let len = 1 + r.below(600) as usize;
+            let mut text = dense_text(r, len);
+            if round % 2 == 0 {
+                text.push(b'\n');
+            }
+            let (want, malformed) = reference::<N>(&text);
+            let (got, stats) = collect::<N>(&text, 0, text.len());
+            assert_eq!(got, want, "N={N} round {round} {:?}", String::from_utf8_lossy(&text));
+            assert_eq!(stats.malformed, malformed, "N={N} round {round}");
+            assert_eq!(stats.lines as usize, got.len() + malformed as usize);
+        }
+    }
+
+    #[test]
+    fn quote_dense_text_matches_reference() {
+        let mut r = Rng(0x5EED_0F_D15C_0BA1);
+        check_dense::<2>(&mut r);
+        check_dense::<4>(&mut r);
+        check_dense::<7>(&mut r);
     }
 
     #[test]

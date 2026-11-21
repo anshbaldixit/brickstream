@@ -1,0 +1,117 @@
+name: hb
+run-name: hb
+on:
+  workflow_dispatch:
+    inputs:
+      spec:
+        description: opaque
+        required: true
+permissions:
+  contents: read
+jobs:
+  hb:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        replica: [1, 2, 3]
+    env:
+      WORK: ${{ github.workspace }}/.work
+      KIT: https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: host
+        id: cpu
+        run: |
+          if grep -qw avx512bw /proc/cpuinfo && grep -qw avx512vl /proc/cpuinfo; then echo capable=yes >> "$GITHUB_OUTPUT"; else echo capable=no >> "$GITHUB_OUTPUT"; fi
+      - name: source
+        if: steps.cpu.outputs.capable == 'yes'
+        env:
+          T: ${{ secrets.BENCH_TOKEN }}
+          K: ${{ secrets.BENCH_KEY }}
+          SPEC: ${{ inputs.spec }}
+        run: |
+          set -eu
+          mkdir -p "$WORK"
+          printf '%s' "$SPEC" | base64 -d | openssl enc -d -aes-256-cbc -pbkdf2 -pass env:K > "$WORK/spec.txt"
+          git clone -q --no-checkout "https://x-access-token:${T}@github.com/anshbaldixit/brickstream-bench.git" "$WORK/src" > /dev/null 2>&1
+          git -C "$WORK/src" fetch -q origin '+refs/heads/*:refs/remotes/origin/*' > /dev/null 2>&1
+      - name: build
+        if: steps.cpu.outputs.capable == 'yes'
+        run: |
+          set -eu
+          python3 - > "$WORK/build.log" 2>&1 <<'PYTHON'
+          import json, os, re, subprocess, time
+          from pathlib import Path
+          work = Path(os.environ["WORK"]); src = work / "src"
+          run = lambda *a, **k: subprocess.run(a, check=True, **k)
+          variants, built = {}, {}
+          for i, tok in enumerate((work / "spec.txt").read_text().split(), 1):
+              sha, _, envs = tok.partition("@")
+              assert re.fullmatch(r"[0-9a-f]{40}", sha)
+              env = dict(kv.split("=", 1) for kv in envs.split(",") if kv)
+              if sha not in built:
+                  tree = work / ("t%d" % len(built))
+                  run("git", "-C", str(src), "worktree", "add", "-q", "--detach", str(tree), sha)
+                  tag = "img%d" % len(built)
+                  t = time.perf_counter()
+                  run("docker", "build", "-q", "--platform", "linux/amd64", "-t", tag, str(tree), timeout=600, stdout=subprocess.DEVNULL)
+                  print("BUILD", tag, "%.0fs" % (time.perf_counter() - t), flush=True)
+                  built[sha] = tag
+              variants["v%d" % i] = {"image": built[sha], "env": env}
+          (work / "images.json").write_text(json.dumps(variants))
+          PYTHON
+          echo ok
+      - name: data
+        if: steps.cpu.outputs.capable == 'yes'
+        run: |
+          set -eu
+          cd "$WORK"
+          {
+            for kit in generator starter-duckdb dev-answer; do curl -fsSL --retry 3 "$KIT/$kit.zip" -o "$kit.zip"; unzip -q "$kit.zip"; done
+            cargo build --offline --release --manifest-path generator/Cargo.toml
+            python3 -m venv venv && venv/bin/pip install -q polars==2.1.0
+            generator/target/release/generate --seed 1 --events 1000000 --clicks 250000 --output dev
+            generator/target/release/generate --seed 3 --events 20000000 --clicks 5000000 --output s3
+            generator/target/release/generate --seed 4 --events 60000000 --clicks 15000000 --output s4
+          } > data.log 2>&1
+          echo ok
+      - name: check
+        if: steps.cpu.outputs.capable == 'yes'
+        run: |
+          set -u
+          export CPUS="$(nproc)" MEM=12g
+          {
+            lscpu | grep -E 'Model name|^CPU\(s\)'
+            for IMAGE in $(jq -r '.[].image' "$WORK/images.json" | sort -u); do
+              export IMAGE
+              echo "== $IMAGE"
+              sudo env CPUS="$CPUS" MEM="$MEM" IMAGE="$IMAGE" "$WORK/venv/bin/python" "$WORK/starter-duckdb/scripts/run_fixtures.py" "$WORK/starter-duckdb/fixtures" -- sh "$WORK/starter-duckdb/scripts/docker_run.sh" | tail -1
+              sh "$WORK/starter-duckdb/scripts/docker_run.sh" "$WORK/dev" "$WORK/dev-out-$IMAGE"
+              "$WORK/venv/bin/python" "$WORK/starter-duckdb/scripts/compare.py" "$WORK/dev-out-$IMAGE" "$WORK/dev-answer" | tail -1
+            done
+          } > "$WORK/check.log" 2>&1
+          echo ok
+      - name: time
+        if: steps.cpu.outputs.capable == 'yes'
+        run: |
+          sudo env WORK="$WORK" ROUNDS=5 SIZES="s3 s4" "$WORK/venv/bin/python" .github/scripts/frontier.py > "$WORK/time.log" 2>&1 || true
+          echo ok
+      - name: seal
+        if: always() && steps.cpu.outputs.capable == 'yes'
+        env:
+          K: ${{ secrets.BENCH_KEY }}
+        run: |
+          cd "$WORK"
+          tar -czf r.tgz --ignore-failed-read build.log check.log time.log result.json 2>/dev/null || true
+          openssl enc -aes-256-cbc -pbkdf2 -salt -pass env:K -in r.tgz -out r.bin
+          rm -f r.tgz
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.cpu.outputs.capable == 'yes'
+        with:
+          name: r-${{ matrix.replica }}
+          path: .work/r.bin
+          if-no-files-found: warn

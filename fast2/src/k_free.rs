@@ -118,46 +118,35 @@ const fn id_shapes_raw(prefix: u8, dig: usize, chk: usize, allow_empty: bool) ->
 struct JidRow {
     ctrl: [u8; 32],
     subv: [u8; 32],
+    lz: [u8; 32],
+    orv: [u64; 4],
 }
-// Adjacent event-ID widths select different L1 sets. Each shape is one line.
-const JID_STRIDE: usize = 65;
-const JID_ROWS: usize = 64 * JID_STRIDE;
+const JID_ROWS: usize = 64 * 64;
 
 const fn jid_rows() -> [JidRow; JID_ROWS] {
     let e = id_shapes_raw(b'e', 0, 8, false);
     let u = id_shapes_raw(b'u', 0, 8, true);
     let mut bad_u = u[0];
     bad_u.subv[8] = 1;
-    let mut t = [JidRow { ctrl: [0x80; 32], subv: [0; 32] }; JID_ROWS];
+    bad_u.orv = [0; 2];
+    let mut t = [JidRow { ctrl: [0; 32], subv: [0; 32], lz: [0; 32], orv: [0; 4] }; JID_ROWS];
     let mut c0 = 0;
     while c0 < 64 {
         let mut d = 0;
         while d < 64 {
-            let r = &mut t[c0 * JID_STRIDE + d];
-            let shapes = [e[c0], if d == 0 { bad_u } else { u[d - 1] }];
-            let mut lane = 0;
-            while lane < 2 {
-                let shape = &shapes[lane];
-                let start = 16 * lane;
-                let mut i = 0;
-                while i < 16 {
-                    r.ctrl[start + i] = shape.ctrl[i];
-                    r.subv[start + i] = shape.subv[i];
-                    i += 1;
-                }
-                // Nonzero leading digit check lives in the otherwise unused
-                // last byte. Subtracting '1' maps '0' to 255; valid digits
-                // and letters remain below 128.
-                i = 0;
-                while i < 8 {
-                    if shape.lz[i] != 0 {
-                        r.ctrl[start + 15] = shape.ctrl[i];
-                        r.subv[start + 15] = b'1';
-                    }
-                    i += 1;
-                }
-                lane += 1;
+            let (a, b) = (&e[c0], if d == 0 { &bad_u } else { &u[d - 1] });
+            let r = &mut t[c0 * 64 + d];
+            let mut i = 0;
+            while i < 16 {
+                r.ctrl[i] = a.ctrl[i];
+                r.ctrl[16 + i] = b.ctrl[i];
+                r.subv[i] = a.subv[i];
+                r.subv[16 + i] = b.subv[i];
+                r.lz[i] = a.lz[i];
+                r.lz[16 + i] = b.lz[i];
+                i += 1;
             }
+            r.orv = [a.orv[1], 0, b.orv[1], 0];
             d += 1;
         }
         c0 += 1;
@@ -768,7 +757,9 @@ unsafe fn and_m(v: __m128i, m: *const u8) -> __m128i {
 }
 #[inline(always)]
 fn jid_off(c0: u64, c1: u64) -> u64 {
-    ((JID_STRIDE as u64 - 1) * c0 + c1) * core::mem::size_of::<JidRow>() as u64
+    let o: u64;
+    unsafe { core::arch::asm!("imul {o}, {a}, 63", "add {o}, {b}", "shl {o}, 7", o = lateout(reg) o, a = in(reg) c0, b = in(reg) c1, options(pure, nomem, nostack)) };
+    o
 }
 #[inline(always)]
 fn add_sub<const D: i32>(a: u64, b: u64) -> u64 {
@@ -881,34 +872,23 @@ unsafe fn ids2v(xa: __m128i, sa: &IdShape, xb: __m128i, sb: &IdShape) -> (__m128
 }
 
 #[inline(always)]
-unsafe fn ids2j<const CLICK: bool>(xa: __m128i, xb: __m128i, r: &JidRow) -> (__m256i, __m256i) {
+unsafe fn ids2j(xa: __m128i, xb: __m128i, r: &JidRow) -> (__m256i, __m256i) {
     unsafe {
         let ld2 = |q: *const u8| _mm256_load_si256(q as *const __m256i);
         let x = _mm256_inserti128_si256::<1>(_mm256_castsi128_si256(xa), xb);
-        let ctrl = ld2(r.ctrl.as_ptr());
-        let mut alphabet = ld2(r.subv.as_ptr());
-        if CLICK {
-            // Byte 8 validates the first identifier's prefix. Invalid widths
-            // already demand a nonzero value from a shuffled zero lane.
-            alphabet = _mm256_add_epi8(alphabet, _mm256_setr_epi64x(0, (b'k' - b'e') as i64, 0, 0));
-        }
-        let v = _mm256_sub_epi8(_mm256_shuffle_epi8(x, ctrl), alphabet);
+        let v = _mm256_sub_epi8(_mm256_shuffle_epi8(x, ld2(r.ctrl.as_ptr())), ld2(r.subv.as_ptr()));
         let e = _mm256_sub_epi8(v, _mm256_set1_epi8(49));
-        let digit_limits = _mm256_set_epi64x(0x7f09_0909_0909_0909, 0x0909_0909_0909_0909, 0x7f09_0909_0909_0909, 0x0909_0909_0909_0909);
-        let notdig = _mm256_subs_epu8(v, digit_limits);
+        let notdig = _mm256_subs_epu8(v, _mm256_set1_epi8(9));
         let notlet = _mm256_subs_epu8(e, _mm256_set1_epi8(25));
         let val = _mm256_min_epu8(v, _mm256_sub_epi8(v, _mm256_set1_epi8(39)));
-        let checks = _mm256_set_epi64x(0x00ff_ffff_ffff_ffff, 0, 0x00ff_ffff_ffff_ffff, 0);
-        let bad = _mm256_ternarylogic_epi64::<0xF8>(_mm256_min_epu8(notdig, notlet), v, checks);
+        let lz = _mm256_subs_epu8(ld2(r.lz.as_ptr()), val);
+        let cls = _mm256_ternarylogic_epi64::<0xF8>(_mm256_min_epu8(notdig, notlet), v, _mm256_set_epi64x(-1, 0, -1, 0));
         let m1 = _mm256_maddubs_epi16(val, _mm256_set1_epi16(0x0124));
         let m2 = _mm256_madd_epi16(m1, _mm256_set1_epi32(0x0001_0510));
         let hi: __m256i;
         core::arch::asm!("vpmuludq {o:y}, {a:y}, {b:y}", o = lateout(zmm_reg) hi, a = in(zmm_reg) m2, b = in(zmm_reg) _mm256_set1_epi64x(1_679_616), options(pure, nomem, nostack, preserves_flags));
         let ids = _mm256_add_epi64(hi, _mm256_srli_epi64::<32>(m2));
-        // The rightmost digit always has a shuffle source for a nonempty
-        // canonical ID. For an empty ID its zero-fill control has bit 7 set.
-        let empty = _mm256_srai_epi64::<63>(ctrl);
-        (_mm256_or_si256(ids, empty), bad)
+        (_mm256_or_si256(ids, ld2(r.orv.as_ptr() as *const u8)), _mm256_or_si256(cls, lz))
     }
 }
 
@@ -1335,7 +1315,7 @@ unsafe fn ev_s<S: EventSink, const TAIL: bool>(cx: &Cx<EvBatch, S>, p: *const u8
         *(s.byte_add(PP) as *mut u64) = *tr.pp.get_unchecked(qi) | kr.pp;
         let ro = jid_off(c0 as u64, c1 as u64) as usize;
         let jr = &*((T.jid.as_ptr() as *const u8).add(ro) as *const JidRow);
-        let (ids, bad_i) = ids2j::<false>(ld(p.wrapping_add(c0).wrapping_sub(16)), ld(p.wrapping_add(c1).wrapping_sub(16)), jr);
+        let (ids, bad_i) = ids2j(ld(p.wrapping_add(c0).wrapping_sub(16)), ld(p.wrapping_add(c1).wrapping_sub(16)), jr);
         _mm_storel_epi64(s.byte_add(core::mem::offset_of!(EvBatch, eid)) as *mut __m128i, _mm256_castsi256_si128(ids));
         _mm_storel_epi64(s.byte_add(core::mem::offset_of!(EvBatch, uid)) as *mut __m128i, _mm256_extracti128_si256::<1>(ids));
         let q3 = (u3 >> 1) as usize;
@@ -1618,11 +1598,10 @@ unsafe fn cl_s<S: ClickSink, const TAIL: bool>(cx: &Cx<CkBatch, S>, p: *const u8
         let e2 = p.wrapping_add(c2);
         let (cv, bad_c) = dec4(ld(e2.wrapping_sub(16)), sc);
         _mm_storel_epi64(s.byte_add(core::mem::offset_of!(CkBatch, camp)) as *mut __m128i, cv);
-        let shape = &*((T.jid.as_ptr() as *const u8).add(jid_off(c0 as u64, c1 as u64) as usize) as *const JidRow);
-        let (ids, id_checks) = ids2j::<true>(ld(p.wrapping_add(c0).wrapping_sub(16)), ld(p.wrapping_add(c1).wrapping_sub(16)), shape);
-        _mm_storel_epi64(s.byte_add(core::mem::offset_of!(CkBatch, cid)) as *mut __m128i, _mm256_castsi256_si128(ids));
-        _mm_storel_epi64(s.byte_add(core::mem::offset_of!(CkBatch, uid)) as *mut __m128i, _mm256_extracti128_si256::<1>(ids));
-        let bad_id = _mm_or_si128(_mm256_castsi256_si128(id_checks), _mm256_extracti128_si256::<1>(id_checks));
+        let su = &*((T.uid1.as_ptr() as *const u8).add(here(((c1 - c0) << 6) as u64) as usize).sub(64) as *const IdShape);
+        let (ids, bad_id) = ids2v(ld(p.wrapping_add(c0).wrapping_sub(16)), T.kid1.get_unchecked(c0), ld(p.wrapping_add(c1).wrapping_sub(16)), su);
+        _mm_storel_epi64(s.byte_add(core::mem::offset_of!(CkBatch, cid)) as *mut __m128i, ids);
+        store_hi::<{ core::mem::offset_of!(CkBatch, uid) }>(s, ids);
         let jo = (here((nl - c2) as u64) as usize) << 10;
         let tj = &*((T.tj.as_ptr() as *const u8).add(jo).sub(2 * 512) as *const TjRow);
         let (jd, jf) = (&tj.d, &tj.f);
@@ -1823,15 +1802,459 @@ macro_rules! runner {
     };
 }
 runner!(run_events, EventSink, ev, ev_fast, ev_masks, OB, scan_event, pipe_stages, ev_s, ev_d, ev_cold, lim_ev);
-runner!(run_clicks, ClickSink, ck, cl_fast, ck_masks, 0, scan_click, pipe_stages, cl_s, cl_d, cl_cold, lim_ck);
 
 #[inline(always)]
 unsafe fn lim_ev(l: &*const u8) -> *const u8 {
     unsafe { core::ptr::read_volatile(l) }
 }
-#[inline(always)]
-unsafe fn lim_ck(l: &*const u8) -> *const u8 {
-    unsafe { core::ptr::read_volatile(l) }
+
+
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+struct CtsRow {
+    ctrl: [u8; 16],
+    base: [u8; 16],
+    lim: [u8; 16],
+    w1: [i8; 16],
+    w2: [i16; 8],
+    w3: [i16; 8],
+    limv: [i32; 4],
+    kmask2: [u8; 16],
+    kme: [i64; 2],
+    kmf: [i64; 2],
+    ksel: [u8; 16],
+    koff1: i64,
+    pmask: u64,
+    _pad: [u64; 8],
+}
+const CTS_ROWS: usize = 65;
+const fn cts_rows() -> [CtsRow; CTS_ROWS] {
+    let (ja, jb, jc, jd, je, jf) = tj_rows();
+    let mut t = [CtsRow { ctrl: [0; 16], base: [0; 16], lim: [0; 16], w1: [0; 16], w2: [0; 8], w3: [0; 8], limv: [0; 4], kmask2: [0; 16], kme: [0; 2], kmf: [0; 2], ksel: [0; 16], koff1: 0, pmask: 0, _pad: [0; 8] }; CTS_ROWS];
+    let mut r = 0;
+    while r < CTS_ROWS {
+        let j = 2 * if r == 0 { 63 } else { r - 1 };
+        let mut i = 0;
+        while i < 16 {
+            t[r].ctrl[i] = ja[j].ctrl[i];
+            t[r].base[i] = ja[j].base[i];
+            t[r].lim[i] = jb[j].lim[i];
+            t[r].w1[i] = jb[j].w1[i];
+            t[r].kmask2[i] = jd[j].kmask2[i];
+            t[r].ksel[i] = jf[j].ksel[i];
+            i += 1;
+        }
+        let mut i = 0;
+        while i < 8 {
+            t[r].w2[i] = jc[j].w2[i];
+            t[r].w3[i] = jc[j].w3[i];
+            i += 1;
+        }
+        let mut i = 0;
+        while i < 4 {
+            t[r].limv[i] = jd[j].limv[i];
+            i += 1;
+        }
+        t[r].kme = [je[j].kme[0], je[j].kme[1]];
+        t[r].kmf = [je[j].kmf[0], je[j].kmf[1]];
+        t[r].koff1 = jf[j].koff1;
+        t[r].pmask = jf[j].pmask;
+        r += 1;
+    }
+    let mut q = 0;
+    while q < 2 {
+        let raw = 25 + 2 * q;
+        let r = raw + 1;
+        let old = t[r];
+        let src = 16 - raw as i32;
+        let b0 = 11 + q as i32;
+        let mut row = old;
+        row.ctrl = [0x80; 16];
+        row.base = [0; 16];
+        row.lim = [255; 16];
+        row.w1 = [0; 16];
+        let bs = *b"00:00:00";
+        let l = [2u8, 9, 0, 5, 9, 0, 5, 9];
+        let w = [10i8, 1, 0, 10, 1, 0, 10, 1];
+        let mut i = 0;
+        while i < 8 {
+            row.ctrl[i] = (src + b0 + i as i32) as u8;
+            row.base[i] = bs[i];
+            row.lim[i] = l[i];
+            row.w1[i] = w[i];
+            i += 1;
+        }
+        let f = [(9, b'0', 2u8, 10i8), (10, b'0', 9, 1), (12, b'0', 5, 10), (13, b'0', 9, 1), (11, b':', 0, 0)];
+        let mut i = 0;
+        while i < 5 {
+            row.ctrl[8 + i] = (src + b0 + f[i].0) as u8;
+            row.base[8 + i] = f[i].1;
+            row.lim[8 + i] = f[i].2;
+            row.w1[8 + i] = f[i].3;
+            i += 1;
+        }
+        if q == 1 {
+            row.ctrl[13] = 15;
+            row.base[13] = b'"';
+            row.lim[13] = 0;
+        }
+        row.ctrl[14] = (src + b0 + 8) as u8;
+        row.base[14] = b'+';
+        row.lim[14] = 2;
+        row.w1[14] = -1;
+        row.ctrl[15] = (src + b0 + 8) as u8;
+        row.base[15] = b',';
+        row.lim[15] = 255;
+        row.w1[15] = -1;
+        row.w2 = [60, 1, 60, 1, 60, 1, 0, 1];
+        row.limv = [1430, i32::MAX, 1439, -2];
+        row.w3 = [0, 0, 0, 0, 60, 1, 1, 0];
+        row.ksel = [0; 16];
+        row.ksel[14] = 2;
+        assert!(old.kme[1] == 1000 && old.kmf[1] == 60_000 && old.koff1 == q as i64 && old.pmask == DATE_PEXT && old.ksel[8] == 2 && old.w3[4] == 60 && old.w3[6] == 60);
+        t[r] = row;
+        q += 1;
+    }
+    t
+}
+static CTS: [CtsRow; CTS_ROWS] = cts_rows();
+
+const fn camp5_shapes() -> [DecShape; 128] {
+    let mut t = [DecShape { ctrl: [0x80; 16], subv: [0; 16], lz: [0; 16], _pad: [0; 16] }; 128];
+    let mut i = 0;
+    while i < 128 {
+        t[i].subv[8] = 1;
+        i += 1;
+    }
+    let mut q = 0;
+    while q < 2 {
+        let mut nd = 1;
+        while nd <= 4 {
+            let raw = 2 + nd + 2 * q;
+            let mut s = DecShape { ctrl: [0x80; 16], subv: [0; 16], lz: [0; 16], _pad: [0; 16] };
+            let fs = 15 - raw;
+            let ds = 15 - q - nd;
+            let mut j = 0;
+            while j < nd {
+                s.ctrl[4 - nd + j] = (ds + j) as u8;
+                s.subv[4 - nd + j] = b'0';
+                j += 1;
+            }
+            s.ctrl[8] = (fs + q) as u8;
+            s.subv[8] = b'c';
+            s.ctrl[9] = (fs + q + 1) as u8;
+            s.subv[9] = b'_';
+            s.ctrl[10] = 15;
+            s.subv[10] = b',';
+            if q == 1 {
+                s.ctrl[11] = 14;
+                s.subv[11] = b'"';
+                s.ctrl[12] = fs as u8;
+                s.subv[12] = b'"';
+            }
+            if nd > 1 {
+                s.lz[4 - nd] = 1;
+            }
+            t[(raw + 1) * 2 + (1 - q)] = s;
+            nd += 1;
+        }
+        q += 1;
+    }
+    t
+}
+const fn camp5r_shapes() -> [DecShape; 66] {
+    let s = camp5_shapes();
+    let mut t = [s[0]; 66];
+    let mut r = 0;
+    while r <= 32 {
+        t[64 - 2 * r] = s[2 * r];
+        t[64 - 2 * r + 1] = s[2 * r + 1];
+        r += 1;
+    }
+    t
+}
+static CAMP5R: [DecShape; 66] = camp5r_shapes();
+
+const C_CAMP: usize = core::mem::offset_of!(CkBatch, camp);
+const C_CID: usize = core::mem::offset_of!(CkBatch, cid);
+const C_UID: usize = core::mem::offset_of!(CkBatch, uid);
+const C_SCR: usize = core::mem::offset_of!(CkBatch, scratch) - 512;
+const O_KID1: usize = core::mem::offset_of!(Tables, kid1);
+const O_UID1M: usize = core::mem::offset_of!(Tables, uid1) - 64;
+const _: () = assert!(
+    core::mem::offset_of!(CkBatch, ts) == 0
+        && core::mem::offset_of!(CkBatch, camp) == 512
+        && NB * 8 == 512
+        && core::mem::size_of::<CtsRow>() == 256
+        && core::mem::offset_of!(CtsRow, base) == 16
+        && core::mem::offset_of!(CtsRow, lim) == 32
+        && core::mem::offset_of!(CtsRow, w1) == 48
+        && core::mem::offset_of!(CtsRow, w2) == 64
+        && core::mem::offset_of!(CtsRow, w3) == 80
+        && core::mem::offset_of!(CtsRow, limv) == 96
+        && core::mem::offset_of!(CtsRow, kmask2) == 112
+        && core::mem::offset_of!(CtsRow, kme) == 128
+        && core::mem::offset_of!(CtsRow, kmf) == 144
+        && core::mem::offset_of!(CtsRow, ksel) == 160
+        && core::mem::offset_of!(CtsRow, koff1) == 176
+        && core::mem::offset_of!(CtsRow, pmask) == 184
+        && core::mem::size_of::<DecShape>() == 64
+        && core::mem::offset_of!(DecShape, subv) == 16
+        && core::mem::offset_of!(DecShape, lz) == 32
+        && core::mem::size_of::<IdShape>() == 64
+        && core::mem::offset_of!(IdShape, subv) == 16
+        && core::mem::offset_of!(IdShape, lz) == 32
+        && core::mem::offset_of!(IdShape, orv) == 48
+        && core::mem::size_of::<DateEnt>() == 32
+        && core::mem::offset_of!(DateEnt, ms) == 16
+);
+
+macro_rules! cl_ms {
+    ($a:literal, $b:literal, $cin:literal, $nlin:literal, $cout:literal, $nlout:literal, $slot:literal, $row:literal, $x:literal, $days:literal, $bad:literal, $camp:literal, $ids:literal) => {
+        concat!(
+            "lea ", $a, ", [", $b, " + ", $nlin, " + 33]\n",
+            "vpcmpeqb ymm0, ymm13, ymmword ptr [", $a, "]\n",
+            "vpmovmskb ", $cout, ", ymm0\n",
+            "vpcmpeqb ymm1, ymm12, ymmword ptr [", $a, " + 32]\n",
+            "vpmovmskb ", $nlout, ", ymm1\n",
+            "tzcnt ", $nlout, ", ", $nlout, "\n",
+            "prefetcht0 byte ptr [", $a, " + {PFD}]\n",
+            "mov qword ptr [rsp + ", $slot, "], ", $b, "\n",
+            "tzcnt r8d, ", $cin, "\n",
+            "blsr ", $cin, ", ", $cin, "\n",
+            "tzcnt r9d, ", $cin, "\n",
+            "blsr ", $cin, ", ", $cin, "\n",
+            "tzcnt r10d, ", $cin, "\n",
+            "vmovdqu xmm3, xmmword ptr [", $b, " + r8 - 16]\n",
+            "vmovdqu xmm4, xmmword ptr [", $b, " + r9 - 16]\n",
+            "movzx edx, byte ptr [", $b, " + r9 + 1]\n",
+            "vmovdqu xmm0, xmmword ptr [", $b, " + r10 - 15]\n",
+            "imul edi, r9d, 64\n",
+            "sub r9, r10\n",
+            "and edx, 1\n",
+            "lea rdx, [rdx + r9*2]\n",
+            "shl rdx, 6\n",
+            "vpshufb xmm0, xmm0, xmmword ptr [{CAMP} + rdx + 4096]\n",
+            "vpsubb xmm0, xmm0, xmmword ptr [{CAMP} + rdx + 4096 + 16]\n",
+            "vmovdqa xmm1, xmmword ptr [{CAMP} + rdx + 4096 + 32]\n",
+            "vpsubusb xmm1, xmm1, xmm0\n",
+            "vpsubusb xmm2, xmm0, xmm24\n",
+            "vpmaddubsw xmm0, xmm0, xmm25\n",
+            "vpmaddwd ", $camp, ", xmm0, xmm26\n",
+            "shl r8d, 6\n",
+            "sub edi, r8d\n",
+            "vpshufb xmm3, xmm3, xmmword ptr [{T} + r8 + {KID1}]\n",
+            "vpsubb xmm3, xmm3, xmmword ptr [{T} + r8 + {KID1} + 16]\n",
+            "vpshufb xmm4, xmm4, xmmword ptr [{T} + rdi + {UID1}]\n",
+            "vpsubb xmm4, xmm4, xmmword ptr [{T} + rdi + {UID1} + 16]\n",
+            "vpblendd xmm5, xmm3, xmm4, 12\n",
+            "vpblendd xmm3, xmm4, xmm3, 12\n",
+            "vpternlogq xmm3, xmm1, xmm2, 0xfe\n",
+            "vpaddb xmm4, xmm5, xmm16\n",
+            "vpsubusb xmm4, xmm4, xmm17\n",
+            "vpsubusb xmm6, xmm5, xmm18\n",
+            "vpminub xmm4, xmm6, xmm4\n",
+            "vpaddb xmm6, xmm5, xmm19\n",
+            "vpminub xmm5, xmm5, xmm6\n",
+            "vmovdqu xmm6, xmmword ptr [{T} + rdi + {UID1} + 32]\n",
+            "vpor xmm6, xmm6, xmmword ptr [{T} + r8 + {KID1} + 32]\n",
+            "vpsubusb xmm6, xmm6, xmm5\n",
+            "vpternlogq xmm3, xmm4, xmm6, 0xfe\n",
+            "vpmaddubsw xmm5, xmm5, xmm20\n",
+            "vpmaddwd xmm5, xmm5, xmm21\n",
+            "vpmuludq xmm1, xmm5, xmm22\n",
+            "vpsrlq xmm5, xmm5, 32\n",
+            "vpaddq xmm5, xmm1, xmm5\n",
+            "vporq ", $ids, ", xmm5, xmmword ptr [{T} + rdi + {UID1} + 48]\n",
+            "lea rdx, [", $b, " + r10]\n",
+            "sub r10, ", $nlin, "\n",
+            "imul ", $row, ", r10, -256\n",
+            "add rdx, qword ptr [{CTS} + ", $row, " + 8192 + 176]\n",
+            "movzx r9d, word ptr [rdx + 9]\n",
+            "pext r9, r9, qword ptr [{CTS} + ", $row, " + 8192 + 184]\n",
+            "shl r9d, 5\n",
+            "vmovdqu64 ", $bad, ", xmmword ptr [r15 + r9 + {SCR}]\n",
+            "vpxorq ", $bad, ", ", $bad, ", xmmword ptr [rdx]\n",
+            "vpternlogq ", $bad, ", xmm3, xmmword ptr [{CTS} + ", $row, " + 8192 + 112], 0xec\n",
+            "vmovdqu64 ", $days, ", xmmword ptr [r15 + r9 + {SCR} + 16]\n",
+            "vmovdqu64 ", $x, ", xmmword ptr [", $a, " - 17]\n",
+        )
+    };
+}
+macro_rules! cl_d {
+    ($badx:literal, $full:literal, $row:literal, $x:literal, $days:literal, $bad:literal, $camp:literal, $ids:literal) => {
+        concat!(
+            "vpshufb xmm0, ", $x, ", xmmword ptr [{CTS} + ", $row, " + 8192]\n",
+            "vpsubb xmm0, xmm0, xmmword ptr [{CTS} + ", $row, " + 8192 + 16]\n",
+            "vpmaddubsw xmm1, xmm0, xmmword ptr [{CTS} + ", $row, " + 8192 + 48]\n",
+            "vpmaddwd xmm1, xmm1, xmmword ptr [{CTS} + ", $row, " + 8192 + 64]\n",
+            "vpackusdw xmm2, xmm1, xmm1\n",
+            "vpmaddwd xmm2, xmm2, xmmword ptr [{CTS} + ", $row, " + 8192 + 80]\n",
+            "vpsubusb xmm3, xmm0, xmmword ptr [{CTS} + ", $row, " + 8192 + 32]\n",
+            "vpcmpgtd xmm1, xmm1, xmmword ptr [{CTS} + ", $row, " + 8192 + 96]\n",
+            "vptestnmq k1, xmm0, xmmword ptr [{CTS} + ", $row, " + 8192 + 160]\n",
+            "vpmuludq xmm4, xmm2, xmmword ptr [{CTS} + ", $row, " + 8192 + 128]\n",
+            "vpsrlq xmm2, xmm2, 32\n",
+            "vpmuldq xmm2, xmm2, xmmword ptr [{CTS} + ", $row, " + 8192 + 144]\n",
+            "vpsubq xmm2{{k1}}, xmm23, xmm2\n",
+            "vpaddq xmm4, xmm4, ", $days, "\n",
+            "vpaddq xmm4, xmm4, xmm2\n",
+            "vmovhps qword ptr [r15 + rbx], xmm4\n",
+            "vmovq qword ptr [r15 + rbx + {CAMPO}], ", $camp, "\n",
+            "vmovq qword ptr [r15 + rbx + {CIDO}], ", $ids, "\n",
+            "vmovhps qword ptr [r15 + rbx + {UIDO}], ", $ids, "\n",
+            "vpternlogq xmm3, xmm1, ", $bad, ", 0xfe\n",
+            "vptest xmm3, xmm3\n",
+            "jnz ", $badx, "\n",
+            "add rbx, 8\n",
+            "jz ", $full, "\n",
+        )
+    };
+}
+
+const CL_REACH: usize = (NB + 3) * 65 + 64;
+
+#[inline(never)]
+unsafe fn cl_loop(p: *const u8, w: *mut i64, b512: *mut u8) -> (u64, *const u8, *mut i64) {
+    let (code, np, nw): (u64, *const u8, *mut i64);
+    unsafe {
+        core::arch::asm!(
+            "push rbx",
+            "push rbp",
+            "sub rsp, 16",
+            "mov r15, rdx",
+            "mov rbx, rsi",
+            "sub rbx, r15",
+            "mov rbp, rdi",
+            "mov eax, 0x2c2c2c2c",
+            "vmovd xmm13, eax",
+            "vpbroadcastd ymm13, xmm13",
+            "mov eax, 0x0a0a0a0a",
+            "vmovd xmm12, eax",
+            "vpbroadcastd ymm12, xmm12",
+            "mov eax, 0xcfcfcfcf",
+            "vpbroadcastd xmm16, eax",
+            "mov eax, 0x19191919",
+            "vpbroadcastd xmm17, eax",
+            "mov eax, 0x09090909",
+            "vpbroadcastd xmm18, eax",
+            "vmovd xmm0, eax",
+            "vmovdqa64 xmm24, xmm0",
+            "mov eax, 0xd9d9d9d9",
+            "vpbroadcastd xmm19, eax",
+            "mov eax, 0x01240124",
+            "vpbroadcastd xmm20, eax",
+            "mov eax, 0x00010510",
+            "vpbroadcastd xmm21, eax",
+            "mov eax, 1679616",
+            "vpbroadcastq xmm22, rax",
+            "vpxord xmm23, xmm23, xmm23",
+            "mov eax, 0x010a010a",
+            "vmovd xmm0, eax",
+            "vmovdqa64 xmm25, xmm0",
+            "mov eax, 0x00010064",
+            "vmovd xmm0, eax",
+            "vmovdqa64 xmm26, xmm0",
+            "vpcmpeqb ymm0, ymm13, ymmword ptr [rbp]",
+            "vpmovmskb eax, ymm0",
+            "vpcmpeqb ymm1, ymm12, ymmword ptr [rbp + 32]",
+            "vpmovmskb ecx, ymm1",
+            "tzcnt ecx, ecx",
+            cl_ms!("r12", "rbp", "eax", "rcx", "r11d", "r13d", "0", "rsi", "xmm8", "xmm9", "xmm10", "xmm11", "xmm27"),
+            ".p2align 5",
+            "2:",
+            cl_ms!("rbp", "r12", "r11d", "r13", "eax", "ecx", "8", "r14", "xmm28", "xmm29", "xmm30", "xmm31", "xmm7"),
+            cl_d!("92f", "82f", "rsi", "xmm8", "xmm9", "xmm10", "xmm11", "xmm27"),
+            cl_ms!("r12", "rbp", "eax", "rcx", "r11d", "r13d", "0", "rsi", "xmm8", "xmm9", "xmm10", "xmm11", "xmm27"),
+            cl_d!("93f", "83f", "r14", "xmm28", "xmm29", "xmm30", "xmm31", "xmm7"),
+            "jmp 2b",
+            "92:",
+            "mov rdi, qword ptr [rsp]",
+            "mov eax, 1",
+            "jmp 6f",
+            "93:",
+            "mov rdi, qword ptr [rsp + 8]",
+            "mov eax, 1",
+            "jmp 6f",
+            "82:",
+            "mov rdi, qword ptr [rsp + 8]",
+            "mov eax, 2",
+            "jmp 6f",
+            "83:",
+            "mov rdi, qword ptr [rsp]",
+            "mov eax, 2",
+            "6:",
+            "lea rsi, [r15 + rbx]",
+            "add rsp, 16",
+            "pop rbp",
+            "pop rbx",
+            inout("rdi") p => np,
+            inout("rsi") w => nw,
+            inout("rdx") b512 => _,
+            out("rax") code,
+            out("rcx") _, out("r8") _, out("r9") _, out("r10") _, out("r11") _, out("r12") _, out("r13") _, out("r14") _, out("r15") _,
+            out("zmm0") _, out("zmm1") _, out("zmm2") _, out("zmm3") _, out("zmm4") _, out("zmm5") _, out("zmm6") _, out("zmm7") _,
+            out("zmm8") _, out("zmm9") _, out("zmm10") _, out("zmm11") _, out("zmm12") _, out("zmm13") _,
+            out("zmm16") _, out("zmm17") _, out("zmm18") _, out("zmm19") _, out("zmm20") _, out("zmm21") _, out("zmm22") _, out("zmm23") _,
+            out("zmm24") _, out("zmm25") _, out("zmm26") _, out("zmm27") _, out("zmm28") _, out("zmm29") _, out("zmm30") _, out("zmm31") _,
+            out("k1") _,
+            T = sym T, CTS = sym CTS, CAMP = sym CAMP5R,
+            KID1 = const O_KID1, UID1 = const O_UID1M,
+            CAMPO = const C_CAMP, CIDO = const C_CID, UIDO = const C_UID, SCR = const C_SCR, PFD = const PFD,
+        );
+    }
+    (code, np, nw)
+}
+
+#[inline(never)]
+unsafe fn run_clicks<S: ClickSink, const MODE: u8>(buf: &[u8], sink: &mut S) {
+    unsafe {
+        let base = buf.as_ptr();
+        let len = buf.len();
+        let end = base.add(len);
+        let b = sink.ck();
+        let sink: *mut S = sink;
+        let cx = &Cx { base, end, b, cache: (*b).scratch.as_mut_ptr() as *mut DateEnt, sink };
+        let mut w = (*b).ts.as_mut_ptr().add((*b).n);
+        let mut p = base;
+        if MODE == PIPE && len >= CL_REACH {
+            let enter = end.sub(CL_REACH);
+            let b512 = (*b).camp.as_mut_ptr() as *mut u8;
+            while p <= enter {
+                let (code, np, nw) = cl_loop(p, w, b512);
+                p = np;
+                w = nw;
+                if code == 2 {
+                    (*b).n = NB;
+                    (*sink).ck_flush();
+                    w = (*b).ts.as_mut_ptr();
+                } else {
+                    let k = ck_masks(p);
+                    p = cl_fast::<S, false>(cx, p, k, k.next(p), &mut w);
+                }
+            }
+        }
+        if MODE == CHAIN {
+            const REACH: usize = 2 * 64 + 1;
+            if len >= REACH {
+                let lim = end.sub(REACH);
+                while p <= lim {
+                    let k = ck_masks(p);
+                    _mm_prefetch::<_MM_HINT_T0>(p.wrapping_add(PFD) as *const i8);
+                    p = cl_fast::<S, false>(cx, p, k, k.next(p), &mut w);
+                }
+            }
+        }
+        while p.wrapping_add(64) <= end {
+            let k = ck_masks(p);
+            p = cl_fast::<S, true>(cx, p, k, k.next(p), &mut w);
+        }
+        (*b).n = w.offset_from((*b).ts.as_ptr()) as usize;
+        let mut pos = p.offset_from(base) as usize;
+        while pos < buf.len() {
+            pos = scan_click(buf, pos, &mut *sink);
+        }
+    }
 }
 
 mod slow {

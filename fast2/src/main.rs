@@ -61,7 +61,7 @@ pub const fn env_u32(s: Option<&str>, d: u32) -> u32 {
         }
     }
 }
-pub const BB: u32 = env_u32(option_env!("XL_BB"), 14);
+pub const BB: u32 = env_u32(option_env!("XL_BB"), 15);
 pub const SPIN_US_DEFAULT: u64 = env_u32(option_env!("XL_SPIN_DEF"), 400) as u64;
 pub const BSIZE: usize = 1 << BB;
 pub const UB: u32 = env_u32(option_env!("XL_UB"), 12);
@@ -297,6 +297,7 @@ fn main() {
     }
     let (data, outdir) = dirs(&args, 0);
     sys::exec_init(&args, &data, &outdir, ncpu_env());
+    sys::fd_reserve();
     std::panic::set_hook(Box::new(|info| {
         eprintln!("[v2b] panic: {info}");
         sys::fallback("panic")
@@ -333,6 +334,18 @@ fn main() {
         sys::SPIN_TICKS.store(SPIN_US_DEFAULT * 2000, std::sync::atomic::Ordering::Relaxed);
     }
     sys::PIN_AT_START.store(parse::pin_mode() == 2 && std::env::var("XL_PINSTART").is_ok_and(|v| v == "1"), std::sync::atomic::Ordering::Relaxed);
+    if std::env::var("XL_NOTOUCH").is_ok_and(|v| v == "0") {
+        sys::CORE_NOTOUCH.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+    if let Some(v) = std::env::var("XL_KP").ok().and_then(|v| v.trim().parse().ok()) {
+        sys::SETUP_KP.store(v, std::sync::atomic::Ordering::Relaxed);
+    }
+    if let Ok(v) = std::env::var("XL_RGREL") {
+        out::REGION_UNMAP.store(v == "1", std::sync::atomic::Ordering::Relaxed);
+    }
+    if std::env::var("XL_PPARTS").is_ok_and(|v| v == "0") {
+        sys::SETUP_PARTS.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
     if std::env::var("XL_POOL").map_or(true, |v| v == "1") {
         sys::pool_start(nt);
     }
@@ -434,7 +447,8 @@ fn main() {
     #[cfg(feature = "tl")]
     let rel0 = sys::tl::now();
     let endrel = std::env::var("XL_ENDREL").ok();
-    if (sys::SMALLPAGES.load(std::sync::atomic::Ordering::Relaxed) && endrel.as_deref().map_or(true, |v| v == "1")) || endrel.as_deref() == Some("2") {
+    let many_faults = endrel.is_none() && sys::minflt(0) as usize > 2 * (g.files.last().map_or(0, |f| f.off + f.len) >> 16) + 60_000;
+    if ((sys::SMALLPAGES.load(std::sync::atomic::Ordering::Relaxed) || many_faults) && endrel.as_deref().map_or(true, |v| v == "1")) || endrel.as_deref() == Some("2") {
         let nt = g.nt;
         let mut r = [[(0usize, 0usize); 12]; 16];
         for tid in 0..nt {

@@ -106,6 +106,47 @@ pub fn chunks(files: &[Input], file_offset: u32, target: usize) -> Vec<Chunk> {
     out
 }
 
+/// Unmaps (or frees) inputs that are no longer needed, on `threads` helper threads that are never
+/// joined, in pieces of at most 64 MB. Tearing down the mappings of gigabytes of file pages takes
+/// ~100 ms; done here it overlaps the later phases instead of running on one thread at exit.
+/// With `threads == 0` the inputs stay mapped until exit.
+pub fn release(files: Vec<Input>, threads: usize) {
+    if threads == 0 {
+        std::mem::forget(files);
+        return;
+    }
+    const PIECE: usize = 64 << 20;
+    let mut groups: Vec<Vec<(usize, usize)>> = vec![Vec::new(); threads];
+    let mut owned = Vec::new();
+    let mut i = 0;
+    for f in files {
+        match f.data {
+            Data::Map(m) => {
+                let (p, n) = (m.as_ptr() as usize, m.len());
+                // The pieces below unmap it; dropping it too would unmap twice.
+                std::mem::forget(m);
+                for at in (0..n).step_by(PIECE) {
+                    groups[i % threads].push((p + at, PIECE.min(n - at)));
+                    i += 1;
+                }
+            }
+            Data::Owned(v) => owned.push(v),
+        }
+    }
+    let mut owned = Some(owned);
+    for g in groups {
+        let o = owned.take();
+        std::thread::spawn(move || {
+            for (p, n) in g {
+                // SAFETY: each piece is a page-aligned part of a mapping that nothing references any
+                // more (the `Input` was moved in here, and every record holds copies, not pointers).
+                unsafe { libc::munmap(p as *mut libc::c_void, n) };
+            }
+            drop(o);
+        });
+    }
+}
+
 pub fn total_bytes(files: &[Input]) -> usize {
     files.iter().map(|f| f.data.len()).sum()
 }

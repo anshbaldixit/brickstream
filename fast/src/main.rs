@@ -85,10 +85,19 @@ pub fn ms(t: Instant) -> f64 {
     t.elapsed().as_secs_f64() * 1000.0
 }
 
+/// Minor page faults and system CPU ms so far, for the stage log.
+fn faults() -> (u64, u64) {
+    // SAFETY: getrusage only writes the struct we pass.
+    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+    unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
+    (ru.ru_minflt as u64, ru.ru_stime.tv_sec as u64 * 1000 + ru.ru_stime.tv_usec as u64 / 1000)
+}
+
 macro_rules! stage {
-    ($name:expr, $t:expr $(, $k:literal = $v:expr)*) => {
-        eprintln!(concat!("[fast] stage={} ms={:.1}" $(, " ", $k, "={}")*), $name, ms($t) $(, $v)*);
-    };
+    ($name:expr, $t:expr $(, $k:literal = $v:expr)*) => {{
+        let (flt, sys) = faults();
+        eprintln!(concat!("[fast] stage={} ms={:.1}" $(, " ", $k, "={}")*, " minflt={} sys_ms={}"), $name, ms($t) $(, $v)*, flt, sys);
+    }};
 }
 
 fn main() {
@@ -111,7 +120,7 @@ fn run(cfg: Config) {
     let open_all = |dir: &str| -> Vec<Input> { list_csv(&cfg.data.join(dir)).par_iter().map(|p| open(p)).collect() };
     let (ev_files, (cl_files, ln_files)) =
         rayon::join(|| open_all("events"), || rayon::join(|| open_all("clicks"), || open_all("links")));
-    let ev_chunks = chunks(&ev_files, 0, EVENT_CHUNK_BYTES);
+    let ev_chunks = chunks(&ev_files, 0, tune("EV_CHUNK_KB", EVENT_CHUNK_BYTES >> 10) << 10);
     let cl_chunks = chunks(&cl_files, 0, CHUNK_BYTES);
     let ln_chunks = chunks(&ln_files, 0, CHUNK_BYTES);
     let ev_bytes = total_bytes(&ev_files);
@@ -190,6 +199,8 @@ fn run(cfg: Config) {
         "edges" = link_stats.edges, "ids" = link_table.ids, "persons" = link_table.persons,
         "parse_ms" = format!("{:.1}", link_stats.ms_parse), "insert_ms" = format!("{:.1}", link_stats.ms_insert),
         "union_ms" = format!("{:.1}", link_stats.ms_union), "names_ms" = format!("{:.1}", link_stats.ms_names), "compact_ms" = format!("{:.1}", link_stats.ms_compact));
+    // Helper threads that unmap the inputs once they are parsed (0: keep them mapped until exit).
+    let unmap_threads = tune("UNMAP_THREADS", 2);
     let (ev_stats, ev_out, cl_out) = {
         let t = Instant::now();
         let parsed: Vec<(EvChunk, Vec<PRec>, ParseStats)> = ev_chunks
@@ -201,6 +212,7 @@ fn run(cfg: Config) {
             ev_stats.add(*st);
         }
         let (ev_out, ev_events): (Vec<EvChunk>, Vec<Vec<PRec>>) = parsed.into_iter().map(|(c, e, _)| (c, e)).unzip();
+        input::release(ev_files, unmap_threads);
         stage!("events_parse", t, "lines" = ev_stats.lines.lines, "malformed" = ev_stats.lines.malformed,
             "empty_id" = ev_stats.empty_id, "records" = ev_stats.records, "valid_lines" = ev_stats.valid, "p1" = p1);
         let t = Instant::now();
@@ -215,6 +227,8 @@ fn run(cfg: Config) {
         stage!("clicks_parse", t, "lines" = st.lines.lines, "malformed" = st.lines.malformed,
             "empty_id" = st.empty_id, "valid" = st.valid);
         let cl_out: Vec<ClChunk> = cl.into_iter().map(|(c, _)| c).collect();
+        input::release(cl_files, unmap_threads.min(1));
+        input::release(ln_files, unmap_threads.min(1));
         (ev_stats, (ev_out, ev_events), cl_out)
     };
     let (ev_out, mut ev_events) = ev_out;
@@ -371,6 +385,15 @@ fn finish(t_start: Instant) -> ! {
     let (cpu_ms, rss_mb) = usage();
     let end_us = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_micros());
     stage!("total", t_start, "cpu_ms" = cpu_ms, "maxrss_mb" = rss_mb, "end_us" = end_us);
+    if tune("SMAPS", 0) == 1 {
+        if let Ok(s) = std::fs::read_to_string("/proc/self/smaps_rollup") {
+            eprintln!("{s}");
+        }
+    }
+    if tune("NORMAL_EXIT", 0) == 1 {
+        // For profile-guided builds: an instrumented binary writes its profile in an at-exit handler.
+        std::process::exit(0);
+    }
     // SAFETY: _exit only ends the process.
     unsafe { libc::_exit(0) }
 }

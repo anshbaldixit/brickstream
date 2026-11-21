@@ -232,6 +232,79 @@ pub fn parse_ingest_seconds(b: &[u8]) -> Option<i64> {
 }
 
 /// The straightforward byte-by-byte parser, kept as the reference the fast paths are tested against.
+/// Dates already checked, so the common F1/F2 timestamp costs one compare and its time of day.
+/// A slot holds a date prefix `YYYY-MM-DDT` (11 bytes, validated in full once) and its midnight
+/// in epoch seconds; it is picked by the day-of-month digits. One per parsing thread.
+pub struct DayMemo {
+    slots: [(u64, u32, i64); 32],
+}
+
+impl Default for DayMemo {
+    fn default() -> Self {
+        // `u32::MAX` never equals a masked 3-byte key, so empty slots never match.
+        DayMemo { slots: [(0, u32::MAX, 0); 32] }
+    }
+}
+
+impl DayMemo {
+    /// `civil_seconds` for `b` (at least 20 bytes), from the memo when its date is known.
+    #[inline(always)]
+    fn civil_seconds(&mut self, b: &[u8]) -> Option<i64> {
+        let a = u64::from_le_bytes(b[0..8].try_into().unwrap());
+        let k = u32::from_le_bytes(b[8..12].try_into().unwrap()) & 0xFF_FFFF;
+        let slot = &mut self.slots[(((k & 15) * 10 + ((k >> 8) & 15)) & 31) as usize];
+        if slot.0 == a && slot.1 == k {
+            // "HH:MM:SS" at 11..19.
+            const SEP_MASK: u64 = 0x0000_FF00_00FF_0000;
+            const SEP: u64 = 0x0000_3A00_003A_0000;
+            let x = u64::from_le_bytes(b[11..19].try_into().unwrap());
+            let d = (x & !SEP_MASK) | (ZEROS & SEP_MASK);
+            if (x & SEP_MASK) != SEP || !all_digits(d) {
+                return None;
+            }
+            let t = pairs(d);
+            let (hour, minute, second) = ((t & 0xFF) as i64, ((t >> 24) & 0xFF) as i64, ((t >> 48) & 0xFF) as i64);
+            if hour > 23 || minute > 59 || second > 59 {
+                return None;
+            }
+            return Some(slot.2 + hour * 3_600 + minute * 60 + second);
+        }
+        let s = civil_seconds(b)?;
+        *slot = (a, k, s - s.rem_euclid(86_400));
+        Some(s)
+    }
+
+    /// `parse_ts`, with the memo.
+    #[inline(always)]
+    pub fn parse_ts(&mut self, b: &[u8]) -> Option<i64> {
+        match b.len() {
+            20 if b[19] == b'Z' => self.civil_seconds(b).map(|s| s * MS_PER_SECOND),
+            25 if b[19] == b'+' || b[19] == b'-' => {
+                let sign = if b[19] == b'+' { 1 } else { -1 };
+                let (oh, ok_h) = two(b, 20);
+                let (om, ok_m) = two(b, 23);
+                if !(ok_h & ok_m) || b[22] != b':' || oh > 23 || om > 59 {
+                    return None;
+                }
+                let local = self.civil_seconds(b)?;
+                Some((local - sign * (oh * 3_600 + om * 60)) * MS_PER_SECOND)
+            }
+            _ => parse_f3_ms(b),
+        }
+    }
+
+    /// `parse_ingest_seconds`, with the memo.
+    #[inline(always)]
+    pub fn parse_ingest_seconds(&mut self, b: &[u8]) -> Option<i64> {
+        if b.len() == 20 && b[19] == b'Z' {
+            if let Some(s) = self.civil_seconds(b) {
+                return Some(s);
+            }
+        }
+        parse_ingest_seconds(b)
+    }
+}
+
 #[cfg(test)]
 pub fn parse_ts_reference(b: &[u8]) -> Option<i64> {
     match b.len() {
@@ -384,6 +457,7 @@ mod tests {
         let seeds = ["2026-10-03T23:58:10Z", "2028-02-29T00:00:00Z", "2026-10-03T19:58:10-04:00", "1791071890000", "1999-12-31T23:59:59+05:45", "2100-02-28T12:00:00Z", "1900-03-01T00:00:00Z", "2199-12-31T23:59:59Z"];
         let alphabet: &[u8] = &[b'0', b'1', b'2', b'5', b'9', b'-', b'+', b':', b'T', b'Z', b't', b'z', b' ', b'.', 13, 0, 0xFF, b'/'];
         let mut x: u64 = 42;
+        let mut memo = DayMemo::default();
         for _ in 0..400_000 {
             x ^= x << 13;
             x ^= x >> 7;
@@ -394,6 +468,8 @@ mod tests {
                 s[at] = alphabet[((x >> (40 + 4 * m)) % alphabet.len() as u64) as usize];
             }
             assert_eq!(parse_ts(&s), parse_ts_reference(&s), "{:?}", String::from_utf8_lossy(&s));
+            assert_eq!(memo.parse_ts(&s), parse_ts_reference(&s), "memo {:?}", String::from_utf8_lossy(&s));
+            assert_eq!(memo.parse_ingest_seconds(&s), parse_ingest_seconds(&s), "memo {:?}", String::from_utf8_lossy(&s));
             if s.len() == 20 {
                 assert_eq!(parse_f1_seconds(&s).map(|v| v * 1000), if s[19] == b'Z' { parse_ts_reference(&s) } else { None });
             }

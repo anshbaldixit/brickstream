@@ -11,7 +11,7 @@ use crate::key::{key_of, mix};
 use crate::links::{LinkTable, AHEAD};
 use crate::lookups::{Products, Window};
 use crate::scan::{for_each_line, LineStats};
-use crate::ts::{parse_ingest_seconds, parse_ts, MS_PER_SECOND};
+use crate::ts::{DayMemo, MS_PER_SECOND};
 
 /// One parsed event line (32 bytes).
 #[repr(C)]
@@ -82,18 +82,18 @@ pub struct EventParser<'a> {
 impl EventParser<'_> {
     /// The record for one well-formed line, or `None` if its `event_id` is empty (dropped at parse).
     #[inline(always)]
-    pub fn parse(&self, f: &[&[u8]; 7]) -> Option<EvRec> {
+    pub fn parse(&self, f: &[&[u8]; 7], memo: &mut DayMemo) -> Option<EvRec> {
         if f[0].is_empty() {
             return None;
         }
         let w = &self.window;
-        let ingest = parse_ingest_seconds(f[3]);
+        let ingest = memo.parse_ingest_seconds(f[3]);
         let ing = match ingest {
             Some(s) => (s + ING_BIAS).clamp(0, ING_MAX) as u64,
             None => ING_MAX as u64,
         };
         let mut valid = ingest.is_some() & !f[1].is_empty() & !f[5].is_empty();
-        let ts_ms = match parse_ts(f[2]) {
+        let ts_ms = match memo.parse_ts(f[2]) {
             Some(t) if t >= w.start && t < w.end => t,
             _ => {
                 valid = false;
@@ -246,7 +246,8 @@ pub fn parse_chunk(parser: &EventParser, links: &LinkTable, data: &[u8], start: 
             }
         };
         let mut st = ParseStats::default();
-        st.lines = for_each_line::<7, _>(data, start, end, |f| match parser.parse(f) {
+        let mut memo = DayMemo::default();
+        st.lines = for_each_line::<7, _>(data, start, end, |f| match parser.parse(f, &mut memo) {
             Some(rec) => {
                 st.records += 1;
                 st.valid += rec.valid() as u64;

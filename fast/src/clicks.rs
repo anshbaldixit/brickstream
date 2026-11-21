@@ -11,7 +11,7 @@ use crate::key::{key_of, mix};
 use crate::links::{LinkTable, AHEAD};
 use crate::lookups::{Campaigns, Window};
 use crate::scan::for_each_line;
-use crate::ts::parse_ts;
+use crate::ts::DayMemo;
 use crate::events::ParseStats;
 
 /// One valid click (24 bytes). `who` is the person key (resolved while parsing).
@@ -34,7 +34,7 @@ pub struct ClickParser<'a> {
 impl ClickParser<'_> {
     /// `Ok(Some)` for a valid click, `Ok(None)` for an invalid one, `Err` for an empty click_id.
     #[inline(always)]
-    pub fn parse(&self, f: &[&[u8]; 4]) -> Result<Option<ClickRec>, ()> {
+    pub fn parse(&self, f: &[&[u8]; 4], memo: &mut DayMemo) -> Result<Option<ClickRec>, ()> {
         if f[0].is_empty() {
             return Err(());
         }
@@ -42,7 +42,7 @@ impl ClickParser<'_> {
             return Ok(None);
         }
         let w = &self.window;
-        let ts = match parse_ts(f[3]) {
+        let ts = match memo.parse_ts(f[3]) {
             Some(t) if t >= w.base && t < w.end => t,
             _ => return Ok(None),
         };
@@ -66,7 +66,8 @@ pub fn parse_chunk(parser: &ClickParser, links: &LinkTable, data: &[u8], start: 
         tmp.clear();
         qs.clear();
         let mut st = ParseStats::default();
-        st.lines = for_each_line::<4, _>(data, start, end, |f| match parser.parse(f) {
+        let mut memo = DayMemo::default();
+        st.lines = for_each_line::<4, _>(data, start, end, |f| match parser.parse(f, &mut memo) {
             Ok(Some(c)) => {
                 st.records += 1;
                 st.valid += 1;

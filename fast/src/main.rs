@@ -119,6 +119,29 @@ fn run(cfg: Config) {
     stage!("setup", t, "threads" = threads, "event_files" = ev_files.len(), "event_bytes" = ev_bytes,
         "click_bytes" = cl_bytes, "link_bytes" = total_bytes(&ln_files), "chunks" = ev_chunks.len() + cl_chunks.len() + ln_chunks.len());
 
+    if cfg.mode == "readtouch" {
+        // Baseline for reading instead of mapping: pread every chunk in 1 MB pieces into a reused
+        // per-thread buffer and count newlines.
+        let t = Instant::now();
+        let all: Vec<(&std::path::Path, usize, usize)> = ev_chunks.iter().map(|c| (ev_files[c.file as usize].path.as_path(), c.start, c.end))
+            .chain(cl_chunks.iter().map(|c| (cl_files[c.file as usize].path.as_path(), c.start, c.end)))
+            .chain(ln_chunks.iter().map(|c| (ln_files[c.file as usize].path.as_path(), c.start, c.end)))
+            .collect();
+        let lines: usize = all.par_iter().map_init(|| vec![0u8; 1 << 20], |buf, &(path, s, e)| {
+            use std::os::unix::fs::FileExt;
+            let f = std::fs::File::open(path).unwrap();
+            let (mut at, mut n) = (s, 0usize);
+            while at < e {
+                let len = (e - at).min(buf.len());
+                f.read_exact_at(&mut buf[..len], at as u64).unwrap();
+                n += memchr::memchr_iter(b'\n', &buf[..len]).count();
+                at += len;
+            }
+            n
+        }).sum();
+        stage!("readtouch", t, "lines" = lines);
+        finish(t_start);
+    }
     if cfg.mode == "touch" {
         // Baseline: read every byte once (count newlines), nothing else.
         let t = Instant::now();
@@ -138,7 +161,7 @@ fn run(cfg: Config) {
     // P2 (person) partitions from the same estimate, so clicks can be partitioned while parsed.
     let p1 = (est_lines / tune("P1_LINES", 10_000)).next_power_of_two().clamp(64, 8192);
     let shift1 = 64 - p1.trailing_zeros();
-    let p2 = (est_lines / tune("P2_EVENTS", 32_000)).next_power_of_two().clamp(64, 2048);
+    let p2 = (est_lines / tune("P2_EVENTS", 32_000)).next_power_of_two().clamp(64, 16384);
     let shift2 = 64 - p2.trailing_zeros();
     let ev_parser = EventParser { window, products: &products };
     let cl_parser = ClickParser { window, campaigns: &campaigns };
@@ -151,7 +174,8 @@ fn run(cfg: Config) {
             if cfg.mode == "scan" {
                 scan::for_each_line::<7, _>(d, c.start, c.end, |f| n += f[0].len() as u64);
             } else {
-                scan::for_each_line::<7, _>(d, c.start, c.end, |f| if let Some(r) = ev_parser.parse(f) { n += r.valid() as u64 });
+                let mut memo = ts::DayMemo::default();
+                scan::for_each_line::<7, _>(d, c.start, c.end, |f| if let Some(r) = ev_parser.parse(f, &mut memo) { n += r.valid() as u64 });
             }
             n
         }).sum();

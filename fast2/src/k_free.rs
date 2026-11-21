@@ -118,35 +118,46 @@ const fn id_shapes_raw(prefix: u8, dig: usize, chk: usize, allow_empty: bool) ->
 struct JidRow {
     ctrl: [u8; 32],
     subv: [u8; 32],
-    lz: [u8; 32],
-    orv: [u64; 4],
 }
-const JID_ROWS: usize = 64 * 64;
+// Adjacent event-ID widths select different L1 sets. Each shape is one line.
+const JID_STRIDE: usize = 65;
+const JID_ROWS: usize = 64 * JID_STRIDE;
 
 const fn jid_rows() -> [JidRow; JID_ROWS] {
     let e = id_shapes_raw(b'e', 0, 8, false);
     let u = id_shapes_raw(b'u', 0, 8, true);
     let mut bad_u = u[0];
     bad_u.subv[8] = 1;
-    bad_u.orv = [0; 2];
-    let mut t = [JidRow { ctrl: [0; 32], subv: [0; 32], lz: [0; 32], orv: [0; 4] }; JID_ROWS];
+    let mut t = [JidRow { ctrl: [0x80; 32], subv: [0; 32] }; JID_ROWS];
     let mut c0 = 0;
     while c0 < 64 {
         let mut d = 0;
         while d < 64 {
-            let (a, b) = (&e[c0], if d == 0 { &bad_u } else { &u[d - 1] });
-            let r = &mut t[c0 * 64 + d];
-            let mut i = 0;
-            while i < 16 {
-                r.ctrl[i] = a.ctrl[i];
-                r.ctrl[16 + i] = b.ctrl[i];
-                r.subv[i] = a.subv[i];
-                r.subv[16 + i] = b.subv[i];
-                r.lz[i] = a.lz[i];
-                r.lz[16 + i] = b.lz[i];
-                i += 1;
+            let r = &mut t[c0 * JID_STRIDE + d];
+            let shapes = [e[c0], if d == 0 { bad_u } else { u[d - 1] }];
+            let mut lane = 0;
+            while lane < 2 {
+                let shape = &shapes[lane];
+                let start = 16 * lane;
+                let mut i = 0;
+                while i < 16 {
+                    r.ctrl[start + i] = shape.ctrl[i];
+                    r.subv[start + i] = shape.subv[i];
+                    i += 1;
+                }
+                // Nonzero leading digit check lives in the otherwise unused
+                // last byte. Subtracting '1' maps '0' to 255; valid digits
+                // and letters remain below 128.
+                i = 0;
+                while i < 8 {
+                    if shape.lz[i] != 0 {
+                        r.ctrl[start + 15] = shape.ctrl[i];
+                        r.subv[start + 15] = b'1';
+                    }
+                    i += 1;
+                }
+                lane += 1;
             }
-            r.orv = [a.orv[1], 0, b.orv[1], 0];
             d += 1;
         }
         c0 += 1;
@@ -757,9 +768,7 @@ unsafe fn and_m(v: __m128i, m: *const u8) -> __m128i {
 }
 #[inline(always)]
 fn jid_off(c0: u64, c1: u64) -> u64 {
-    let o: u64;
-    unsafe { core::arch::asm!("imul {o}, {a}, 63", "add {o}, {b}", "shl {o}, 7", o = lateout(reg) o, a = in(reg) c0, b = in(reg) c1, options(pure, nomem, nostack)) };
-    o
+    ((JID_STRIDE as u64 - 1) * c0 + c1) * core::mem::size_of::<JidRow>() as u64
 }
 #[inline(always)]
 fn add_sub<const D: i32>(a: u64, b: u64) -> u64 {
@@ -872,23 +881,34 @@ unsafe fn ids2v(xa: __m128i, sa: &IdShape, xb: __m128i, sb: &IdShape) -> (__m128
 }
 
 #[inline(always)]
-unsafe fn ids2j(xa: __m128i, xb: __m128i, r: &JidRow) -> (__m256i, __m256i) {
+unsafe fn ids2j<const CLICK: bool>(xa: __m128i, xb: __m128i, r: &JidRow) -> (__m256i, __m256i) {
     unsafe {
         let ld2 = |q: *const u8| _mm256_load_si256(q as *const __m256i);
         let x = _mm256_inserti128_si256::<1>(_mm256_castsi128_si256(xa), xb);
-        let v = _mm256_sub_epi8(_mm256_shuffle_epi8(x, ld2(r.ctrl.as_ptr())), ld2(r.subv.as_ptr()));
+        let ctrl = ld2(r.ctrl.as_ptr());
+        let mut alphabet = ld2(r.subv.as_ptr());
+        if CLICK {
+            // Byte 8 validates the first identifier's prefix. Invalid widths
+            // already demand a nonzero value from a shuffled zero lane.
+            alphabet = _mm256_add_epi8(alphabet, _mm256_setr_epi64x(0, (b'k' - b'e') as i64, 0, 0));
+        }
+        let v = _mm256_sub_epi8(_mm256_shuffle_epi8(x, ctrl), alphabet);
         let e = _mm256_sub_epi8(v, _mm256_set1_epi8(49));
-        let notdig = _mm256_subs_epu8(v, _mm256_set1_epi8(9));
+        let digit_limits = _mm256_set_epi64x(0x7f09_0909_0909_0909, 0x0909_0909_0909_0909, 0x7f09_0909_0909_0909, 0x0909_0909_0909_0909);
+        let notdig = _mm256_subs_epu8(v, digit_limits);
         let notlet = _mm256_subs_epu8(e, _mm256_set1_epi8(25));
         let val = _mm256_min_epu8(v, _mm256_sub_epi8(v, _mm256_set1_epi8(39)));
-        let lz = _mm256_subs_epu8(ld2(r.lz.as_ptr()), val);
-        let cls = _mm256_ternarylogic_epi64::<0xF8>(_mm256_min_epu8(notdig, notlet), v, _mm256_set_epi64x(-1, 0, -1, 0));
+        let checks = _mm256_set_epi64x(0x00ff_ffff_ffff_ffff, 0, 0x00ff_ffff_ffff_ffff, 0);
+        let bad = _mm256_ternarylogic_epi64::<0xF8>(_mm256_min_epu8(notdig, notlet), v, checks);
         let m1 = _mm256_maddubs_epi16(val, _mm256_set1_epi16(0x0124));
         let m2 = _mm256_madd_epi16(m1, _mm256_set1_epi32(0x0001_0510));
         let hi: __m256i;
         core::arch::asm!("vpmuludq {o:y}, {a:y}, {b:y}", o = lateout(zmm_reg) hi, a = in(zmm_reg) m2, b = in(zmm_reg) _mm256_set1_epi64x(1_679_616), options(pure, nomem, nostack, preserves_flags));
         let ids = _mm256_add_epi64(hi, _mm256_srli_epi64::<32>(m2));
-        (_mm256_or_si256(ids, ld2(r.orv.as_ptr() as *const u8)), _mm256_or_si256(cls, lz))
+        // The rightmost digit always has a shuffle source for a nonempty
+        // canonical ID. For an empty ID its zero-fill control has bit 7 set.
+        let empty = _mm256_srai_epi64::<63>(ctrl);
+        (_mm256_or_si256(ids, empty), bad)
     }
 }
 
@@ -1315,7 +1335,7 @@ unsafe fn ev_s<S: EventSink, const TAIL: bool>(cx: &Cx<EvBatch, S>, p: *const u8
         *(s.byte_add(PP) as *mut u64) = *tr.pp.get_unchecked(qi) | kr.pp;
         let ro = jid_off(c0 as u64, c1 as u64) as usize;
         let jr = &*((T.jid.as_ptr() as *const u8).add(ro) as *const JidRow);
-        let (ids, bad_i) = ids2j(ld(p.wrapping_add(c0).wrapping_sub(16)), ld(p.wrapping_add(c1).wrapping_sub(16)), jr);
+        let (ids, bad_i) = ids2j::<false>(ld(p.wrapping_add(c0).wrapping_sub(16)), ld(p.wrapping_add(c1).wrapping_sub(16)), jr);
         _mm_storel_epi64(s.byte_add(core::mem::offset_of!(EvBatch, eid)) as *mut __m128i, _mm256_castsi256_si128(ids));
         _mm_storel_epi64(s.byte_add(core::mem::offset_of!(EvBatch, uid)) as *mut __m128i, _mm256_extracti128_si256::<1>(ids));
         let q3 = (u3 >> 1) as usize;
@@ -1598,10 +1618,11 @@ unsafe fn cl_s<S: ClickSink, const TAIL: bool>(cx: &Cx<CkBatch, S>, p: *const u8
         let e2 = p.wrapping_add(c2);
         let (cv, bad_c) = dec4(ld(e2.wrapping_sub(16)), sc);
         _mm_storel_epi64(s.byte_add(core::mem::offset_of!(CkBatch, camp)) as *mut __m128i, cv);
-        let su = &*((T.uid1.as_ptr() as *const u8).add(here(((c1 - c0) << 6) as u64) as usize).sub(64) as *const IdShape);
-        let (ids, bad_id) = ids2v(ld(p.wrapping_add(c0).wrapping_sub(16)), T.kid1.get_unchecked(c0), ld(p.wrapping_add(c1).wrapping_sub(16)), su);
-        _mm_storel_epi64(s.byte_add(core::mem::offset_of!(CkBatch, cid)) as *mut __m128i, ids);
-        store_hi::<{ core::mem::offset_of!(CkBatch, uid) }>(s, ids);
+        let shape = &*((T.jid.as_ptr() as *const u8).add(jid_off(c0 as u64, c1 as u64) as usize) as *const JidRow);
+        let (ids, id_checks) = ids2j::<true>(ld(p.wrapping_add(c0).wrapping_sub(16)), ld(p.wrapping_add(c1).wrapping_sub(16)), shape);
+        _mm_storel_epi64(s.byte_add(core::mem::offset_of!(CkBatch, cid)) as *mut __m128i, _mm256_castsi256_si128(ids));
+        _mm_storel_epi64(s.byte_add(core::mem::offset_of!(CkBatch, uid)) as *mut __m128i, _mm256_extracti128_si256::<1>(ids));
+        let bad_id = _mm_or_si128(_mm256_castsi256_si128(id_checks), _mm256_extracti128_si256::<1>(id_checks));
         let jo = (here((nl - c2) as u64) as usize) << 10;
         let tj = &*((T.tj.as_ptr() as *const u8).add(jo).sub(2 * 512) as *const TjRow);
         let (jd, jf) = (&tj.d, &tj.f);

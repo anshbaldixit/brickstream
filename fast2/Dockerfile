@@ -1,16 +1,24 @@
 # Shopping Sessions pipeline (Rust). Build context: the repository root.
 #   docker build -f fast2/Dockerfile -t ss:fast2 .
 FROM rust:1.99-alpine AS build
-RUN apk add --no-cache musl-dev
+RUN apk add --no-cache musl-dev gcc binutils
 WORKDIR /src
 COPY fast2/Cargo.toml fast2/Cargo.lock ./
 COPY fast2/.cargo .cargo
 COPY fast2/src src
-RUN cargo build --release --target x86_64-unknown-linux-musl \
- && cp target/x86_64-unknown-linux-musl/release/pipeline /pipeline
+COPY fast2/build/choose.c /tmp/choose.c
+RUN cc -O2 -march=x86-64 -c /tmp/choose.c -o /tmp/choose.o \
+ && cargo rustc --locked --release --target x86_64-unknown-linux-musl -- \
+        -Clink-arg=/tmp/choose.o -Clink-arg=-Wl,--wrap=main \
+        -Clink-arg="$(cc -print-libgcc-file-name)" -Clink-arg=-lc \
+ && cp target/x86_64-unknown-linux-musl/release/pipeline /pipeline \
+ && cargo rustc --locked --release --target x86_64-unknown-linux-musl -- -Ctarget-feature=+avx512ifma \
+ && cp target/x86_64-unknown-linux-musl/release/pipeline /ifma \
+ && strip /pipeline /ifma
 
 FROM scratch
 COPY fast2/LICENSE /LICENSE
 COPY --from=build /pipeline /pipeline
+COPY --from=build /ifma /ifma
 USER 1000:1000
 CMD ["/pipeline"]

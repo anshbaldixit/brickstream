@@ -262,6 +262,8 @@ struct ExecInfo {
     argv0: CString,
     _args: Vec<CString>,
     ptrs: Vec<*const c_char>,
+    _fast_args: Vec<CString>,
+    fast: Vec<*const c_char>,
     data: String,
     out: String,
     ncpu: usize,
@@ -278,8 +280,11 @@ pub fn exec_init(args: &[String], data: &str, out: &str, ncpu: usize) {
     }
     let mut ptrs: Vec<*const c_char> = a.iter().map(|c| c.as_ptr()).collect();
     ptrs.push(std::ptr::null());
+    let fa = vec![cs("/fast"), cs(data), cs(out)];
+    let mut fast: Vec<*const c_char> = fa.iter().map(|c| c.as_ptr()).collect();
+    fast.push(std::ptr::null());
     unsafe {
-        EXEC = Some(ExecInfo { argv0, _args: a, ptrs, data: data.to_string(), out: out.to_string(), ncpu });
+        EXEC = Some(ExecInfo { argv0, _args: a, ptrs, _fast_args: fa, fast, data: data.to_string(), out: out.to_string(), ncpu });
     }
 }
 
@@ -310,6 +315,8 @@ extern "C" fn on_fault(_sig: i32) {
         write(2, msg.as_ptr() as *const core::ffi::c_void, msg.len());
         #[allow(static_mut_refs)]
         if let Some(e) = EXEC.as_ref() {
+            // The portable pipeline first: re-running this binary cannot help after an illegal instruction.
+            execve(c"/fast".as_ptr(), e.fast.as_ptr(), environ);
             execve(c"/proc/self/exe".as_ptr(), e.ptrs.as_ptr(), environ);
             execve(e.argv0.as_ptr(), e.ptrs.as_ptr(), environ);
         }

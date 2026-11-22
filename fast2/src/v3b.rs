@@ -4926,7 +4926,14 @@ fn p1_thread(cx: &Cx, tid: usize) {
         homes.push(0);
         for (i, e) in l.iter().enumerate() {
             let id = if is_short(e.0) {
-                unsafe { ut.entry(mix42(e.0.lo) & rmask) }
+                let rem = mix42(e.0.lo) & rmask;
+                // With 32-bit remainders an empty slot reads as remainder 0xFFFF_FFFF, so `entry` would
+                // take it for a hit. That one value goes through the probing path, which checks for empty.
+                if rem == 0xFFFF_FFFF {
+                    unsafe { ut.slow(rem, true) }
+                } else {
+                    unsafe { ut.entry(rem) }
+                }
             } else {
                 unsafe { ut.slow_w(h32(hash(e.0), b2), e.0, true) }
             } as u32 as usize;

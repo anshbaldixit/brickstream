@@ -457,7 +457,7 @@ const fn tj_table() -> [TjRow; 128] {
     t
 }
 
-const fn tjl_base() -> [TjRow; 130] {
+const fn tjl_table() -> [TjRow; 130] {
     let (ja, jb, jc, jd, je, jf) = tj_rows_g(ts_rows_l(), true);
     let mut t = [TjRow { a: ja[0], b: jb[0], c: jc[0], d: jd[0], e: je[0], f: jf[0], _pad: [0; 16] }; 130];
     let mut k = 2;
@@ -468,181 +468,7 @@ const fn tjl_base() -> [TjRow; 130] {
     }
     t
 }
-const fn tj_dec_eq(x: &TjRow, y: &TjRow) -> bool {
-    let mut i = 0;
-    while i < 32 {
-        if x.a.ctrl[i] != y.a.ctrl[i] || x.a.base[i] != y.a.base[i] || x.b.lim[i] != y.b.lim[i] || x.b.w1[i] != y.b.w1[i] {
-            return false;
-        }
-        i += 1;
-    }
-    let mut i = 0;
-    while i < 16 {
-        if x.c.w2[i] != y.c.w2[i] || x.c.w3[i] != y.c.w3[i] {
-            return false;
-        }
-        i += 1;
-    }
-    let mut i = 0;
-    while i < 8 {
-        if x.d.limv[i] != y.d.limv[i] {
-            return false;
-        }
-        i += 1;
-    }
-    let mut i = 0;
-    while i < 4 {
-        if x.e.kme[i] != y.e.kme[i] || x.e.kmf[i] != y.e.kmf[i] {
-            return false;
-        }
-        i += 1;
-    }
-    true
-}
-const fn tj_classes() -> ([usize; 130], usize) {
-    let t = tjl_base();
-    let mut cls = [0usize; 130];
-    let mut n = 0;
-    let mut k = 0;
-    while k < 130 {
-        let r = &t[k];
-        assert!(r.e.kmf[0] == 0 && r.e.kmf[2] == 0 && r.e.kmf[3] == 0);
-        let mut i = 0;
-        while i < 8 {
-            assert!(r.d.limv[i] >= 0 || (r.c.w2[2 * i] == 0 && r.c.w2[2 * i + 1] == 0));
-            i += 1;
-        }
-        if r.e.kmf[1] != 0 {
-            let f3 = r.a.ctrl[8] == 0x80 && r.a.base[8] == 0xFF && r.b.lim[8] >= 1;
-            let f2 = r.a.ctrl[8] == r.a.ctrl[11] && r.a.ctrl[8] != 0x80 && r.a.base[8] == b'+' && r.b.lim[8] == 2 && r.a.base[11] == b'-' && r.b.lim[11] == 0xFE;
-            assert!(f3 || f2);
-        }
-        let mut j = 0;
-        while j < k && !tj_dec_eq(&t[j], r) {
-            j += 1;
-        }
-        cls[k] = if j < k { cls[j] } else { n += 1; n - 1 };
-        k += 1;
-    }
-    (cls, n)
-}
-const TJ_CLS: ([usize; 130], usize) = tj_classes();
-const TJ_NC: usize = TJ_CLS.1;
-const TJP_RS: usize = 576;
-const fn tjl_table() -> [TjRow; 130] {
-    let mut t = tjl_base();
-    let mut k = 0;
-    while k < 130 {
-        t[k]._pad[0] = (TJ_CLS.0[k] * TJ_NC * TJP_RS) as u64;
-        t[k]._pad[1] = (TJ_CLS.0[k] * TJP_RS) as u64;
-        k += 1;
-    }
-    t
-}
 static TJL: [TjRow; 130] = tjl_table();
-#[repr(C, align(64))]
-#[derive(Clone, Copy)]
-struct TjpRow {
-    p: [[u8; 64]; 9],
-}
-const _: () = assert!(core::mem::size_of::<TjpRow>() == TJP_RS);
-const fn tj_parts(r: &TjRow) -> [[u8; 32]; 9] {
-    let mut o = [[0u8; 32]; 9];
-    let mut i = 0;
-    while i < 32 {
-        o[0][i] = r.a.ctrl[i];
-        o[1][i] = r.a.base[i];
-        o[2][i] = r.b.lim[i];
-        o[3][i] = r.b.w1[i] as u8;
-        i += 1;
-    }
-    let mut i = 0;
-    while i < 16 {
-        let a = r.c.w2[i].to_le_bytes();
-        let b = r.c.w3[i].to_le_bytes();
-        o[4][2 * i] = a[0];
-        o[4][2 * i + 1] = a[1];
-        o[5][2 * i] = b[0];
-        o[5][2 * i + 1] = b[1];
-        i += 1;
-    }
-    let mut i = 0;
-    while i < 8 {
-        let a = r.d.limv[i].to_le_bytes();
-        let mut k = 0;
-        while k < 4 {
-            o[6][4 * i + k] = a[k];
-            k += 1;
-        }
-        i += 1;
-    }
-    let mut i = 0;
-    while i < 4 {
-        let a = r.e.kme[i].to_le_bytes();
-        let b = r.e.kmf[i].to_le_bytes();
-        let mut k = 0;
-        while k < 8 {
-            o[7][8 * i + k] = a[k];
-            o[8][8 * i + k] = b[k];
-            k += 1;
-        }
-        i += 1;
-    }
-    let mut l = 0;
-    while l < 2 {
-        let mut neg = false;
-        let mut i = 0;
-        while i < 4 {
-            if r.d.limv[4 * l + i] < 0 {
-                neg = true;
-            }
-            i += 1;
-        }
-        if neg {
-            o[0][16 * l] = 0x80;
-            o[1][16 * l] = 1;
-            o[2][16 * l] = 0;
-            let mut i = 0;
-            while i < 16 {
-                o[6][16 * l + i] = if i % 4 == 3 { 0x7F } else { 0xFF };
-                i += 1;
-            }
-        }
-        l += 1;
-    }
-    o
-}
-const fn tjp_table() -> [TjpRow; TJ_NC * TJ_NC] {
-    let t = tjl_base();
-    let mut rep = [[[0u8; 32]; 9]; TJ_NC];
-    let mut k = 130;
-    while k > 0 {
-        k -= 1;
-        rep[TJ_CLS.0[k]] = tj_parts(&t[k]);
-    }
-    let mut o = [TjpRow { p: [[0; 64]; 9] }; TJ_NC * TJ_NC];
-    let mut a = 0;
-    while a < TJ_NC {
-        let mut b = 0;
-        while b < TJ_NC {
-            let r = &mut o[a * TJ_NC + b];
-            let mut q = 0;
-            while q < 9 {
-                let mut i = 0;
-                while i < 32 {
-                    r.p[q][i] = rep[a][q][i];
-                    r.p[q][32 + i] = rep[b][q][i];
-                    i += 1;
-                }
-                q += 1;
-            }
-            b += 1;
-        }
-        a += 1;
-    }
-    o
-}
-static TJP: [TjpRow; TJ_NC * TJ_NC] = tjp_table();
 
 const ZLANE: TsA = TsA { ctrl: [0x80; 16], base: [0; 16], lim: [0; 16], w1: [0; 16] };
 const fn xb(k: usize, raw: usize) -> u8 {
@@ -2301,10 +2127,10 @@ struct EvConst {
     nl: [u8; 32],
     quote: [u8; 32],
     pidx: [u64; 4],
-    xidx: [u64; 8],
+    xidx: [u64; 4],
 }
 const fn ev_const() -> EvConst {
-    let mut c = EvConst { e: [0; 32], diglim: [0; 32], letlim: [0; 32], m39: [217; 32], w124: [0x0124; 16], w510: [0x0001_0510; 8], m36: [1_679_616; 4], comma: [b','; 32], nl: [b'\n'; 32], quote: [b'"'; 32], pidx: [1, 5, 2, 6], xidx: [0, 1, 6, 7, 4, 5, 10, 11] };
+    let mut c = EvConst { e: [0; 32], diglim: [0; 32], letlim: [0; 32], m39: [217; 32], w124: [0x0124; 16], w510: [0x0001_0510; 8], m36: [1_679_616; 4], comma: [b','; 32], nl: [b'\n'; 32], quote: [b'"'; 32], pidx: [1, 5, 2, 6], xidx: [0, 1, 6, 7] };
     let mut i = 0;
     while i < 32 {
         let k = i % 16;
@@ -2402,7 +2228,7 @@ macro_rules! ev_consts {
             "vmovdqa ymm15, ymmword ptr [rip + {EVC} + 224]\n",
             "vmovdqa ymm14, ymmword ptr [rip + {EVC} + 256]\n",
             "vmovdqa ymm13, ymmword ptr [rip + {EVC} + 288]\n",
-            "vmovdqu64 zmm16, zmmword ptr [rip + {EVC} + 352]\n",
+            "vmovdqa64 ymm16, ymmword ptr [rip + {EVC} + 352]\n",
             "vmovdqa64 ymm24, ymmword ptr [rip + {EVC} + 0]\n",
             "vmovdqa64 ymm25, ymmword ptr [rip + {EVC} + 32]\n",
             "vmovdqa64 ymm26, ymmword ptr [rip + {EVC} + 64]\n",
@@ -2412,9 +2238,6 @@ macro_rules! ev_consts {
             "kmovd k5, eax\n",
             "mov eax, 12\n",
             "kmovd k1, eax\n",
-            "vpxord xmm19, xmm19, xmm19\n",
-            "mov eax, 0xf0\n",
-            "kmovd k4, eax\n",
         )
     };
 }
@@ -2497,35 +2320,6 @@ macro_rules! ev_dec {
         )
     };
 }
-macro_rules! ev_dec2 {
-    () => {
-        concat!(
-            "mov r10, qword ptr [{TJL} + r13 + 33152]\n",
-            "add r10, qword ptr [{TJL} + r14 + 33160]\n",
-            "vinserti64x4 zmm17, zmm17, ymm20, 1\n",
-            "vinserti64x4 zmm18, zmm18, ymm21, 1\n",
-            "vpshufb zmm0, zmm29, zmmword ptr [{TJP} + r10]\n",
-            "vpsubb zmm1, zmm0, zmmword ptr [{TJP} + r10 + 64]\n",
-            "vpmaddubsw zmm0, zmm1, zmmword ptr [{TJP} + r10 + 192]\n",
-            "vpmaddwd zmm2, zmm0, zmmword ptr [{TJP} + r10 + 256]\n",
-            "vpackusdw zmm0, zmm2, zmm2\n",
-            "vpmaddwd zmm0, zmm0, zmmword ptr [{TJP} + r10 + 320]\n",
-            "vpsubusb zmm23, zmm1, zmmword ptr [{TJP} + r10 + 128]\n",
-            "vpsubusw zmm3, zmm2, zmmword ptr [{TJP} + r10 + 384]\n",
-            "vpmuludq zmm5, zmm0, zmmword ptr [{TJP} + r10 + 448]\n",
-            "vpsrlq zmm0, zmm0, 32\n",
-            "vpmovd2m k7, zmm1\n",
-            "vpsubd zmm0 {{k7}}, zmm19, zmm0\n",
-            "vpmuldq zmm0, zmm0, zmmword ptr [{TJP} + r10 + 512]\n",
-            "vpaddq zmm5, zmm5, zmm17\n",
-            "vpaddq zmm4, zmm5, zmm0\n",
-            "vpternlogq zmm23, zmm3, zmm18, 0xfe\n",
-            "vpermq zmm4, zmm28, zmm4\n",
-            "vmovdqu64 xmmword ptr [r15 + rbx], xmm4\n",
-            "vmovdqu64 ymmword ptr [r15 + rbx + {ING} - 16] {{k1}}, ymm4\n",
-        )
-    };
-}
 macro_rules! ev_hd {
     ($b:literal, $cl:literal, $ch:literal) => {
         concat!(
@@ -2541,7 +2335,7 @@ macro_rules! ev_hd {
     };
 }
 macro_rules! ev_st {
-    ($b:literal, $jo:literal, $x:expr, $d:literal, $b2:literal, $b2x:literal, $v:literal, $ids:expr, $fail:literal, $plab:literal, $pret:literal, $ppst:literal) => {
+    ($b:literal, $jo:literal, $x:literal, $d:literal, $b2:literal, $b2x:literal, $v:literal, $ids:expr, $fail:literal, $plab:literal, $pret:literal, $ppst:literal) => {
         concat!(
             "cmp eax, 31\n",
             "ja ", $fail, "f\n",
@@ -2600,7 +2394,8 @@ macro_rules! ev_st {
             "vpsubb xmm7{{k5}}{{z}}, xmm4, xmmword ptr [rsi + r11]\n",
             "vpternlogq ymm7, ymm6, ymm5, 0xfe\n",
             "vpternlogq ", $b2, ", ymm7, ymm1, 0xfe\n",
-            $x,
+            "vmovdqu64 ", $x, ", ymmword ptr [rsi - 16]\n",
+            "vpermt2q ", $x, ", ymm16, ymmword ptr [rdx - 11]\n",
             "vshufi64x2 ", $d, ", ymm2, ymm4, 3\n",
             "test ecx, ecx\n",
             "jz ", $plab, "f\n",
@@ -2609,23 +2404,13 @@ macro_rules! ev_st {
         )
     };
 }
-macro_rules! ev_xy {
-    ($r:literal) => {
-        concat!("vmovdqu64 ", $r, ", ymmword ptr [rsi - 16]\n", "vpermt2q ", $r, ", ymm16, ymmword ptr [rdx - 11]\n")
-    };
-}
-macro_rules! ev_xb {
-    () => {
-        concat!("vbroadcasti64x4 zmm29 {{k4}}, ymmword ptr [rsi - 16]\n", "vpermt2q zmm29 {{k4}}, zmm16, zmmword ptr [rdx - 11]\n")
-    };
-}
 macro_rules! ev_ids_ab {
     () => {
         "vpunpckhqdq ymm3, ymm22, ymm3\nvpaddb ymm4, ymm3, ymmword ptr [rip + {EVC} + 96]\nvpminub ymm3, ymm3, ymm4\nvpmaddubsw ymm3, ymm3, ymmword ptr [rip + {EVC} + 128]\nvpmaddwd ymm3, ymm3, ymmword ptr [rip + {EVC} + 160]\nvpmuludq ymm4, ymm3, ymmword ptr [rip + {EVC} + 192]\nvpsrlq ymm3, ymm3, 32\nvpaddq ymm3, ymm3, ymm4\nvmovdqu xmmword ptr [r15 + rbx + {EID}], xmm3\nvmovdqu64 ymmword ptr [r15 + rbx + {UID} - 16] {{k1}}, ymm3\n"
     };
 }
 macro_rules! ev_retry {
-    ($lab:literal, $b:literal, $cl:literal, $a:literal, $jo:literal, $x:expr, $d:literal, $b2:literal, $b2x:literal, $v:literal, $ids:expr, $real:literal, $pl:literal, $pr:literal, $ret:literal) => {
+    ($lab:literal, $b:literal, $cl:literal, $a:literal, $jo:literal, $x:literal, $d:literal, $b2:literal, $b2x:literal, $v:literal, $ids:expr, $real:literal, $pl:literal, $pr:literal, $ret:literal) => {
         concat!(
             $lab, ":\n",
             "vpmovmskb ecx, ", $cl, "\n",
@@ -2773,22 +2558,26 @@ unsafe fn ev_loop<S: EventSink>(p: *const u8, w: *mut i64, b: *mut EvBatch, cx: 
             "vpcmpeqb ymm8, ymm15, ymmword ptr [rbp + 32]",
             ev_hd!("rbp", "ymm9", "ymm8"),
             ev_mk!("r12", "rbp", "ymm11", "ymm10"),
-            ev_st!("rbp", "r13", ev_xy!("ymm29"), "ymm17", "ymm18", "xmm18", "ymm22", "", "40", "52", "53", ""),
+            ev_st!("rbp", "r13", "ymm29", "ymm17", "ymm18", "xmm18", "ymm22", "", "40", "52", "53", ""),
             "jmp 22f",
             ".p2align 5",
             "22:",
             "mov qword ptr [r15 + rbx + {PP}], rcx",
             ev_hd!("r12", "ymm11", "ymm10"),
             ev_mk!("rbp", "r12", "ymm9", "ymm8"),
-            ev_st!("r12", "r14", ev_xb!(), "ymm20", "ymm21", "xmm21", "ymm3",
+            ev_dec!("r13", "ymm29", "ymm17", "ymm18", "ymm23", "ymm31"),
+            ev_st!("r12", "r14", "ymm30", "ymm20", "ymm21", "xmm21", "ymm3",
                 ev_ids_ab!(),
                 "41", "54", "55", "mov qword ptr [r15 + rbx + {PP} + 8], rcx\n"),
             ev_hd!("rbp", "ymm9", "ymm8"),
             ev_mk!("r12", "rbp", "ymm11", "ymm10"),
-            ev_dec2!(),
-            ev_st!("rbp", "r13", ev_xy!("ymm29"), "ymm17", "ymm18", "xmm18", "ymm22", "", "42", "56", "57", ""),
-            "vptestmq k0, zmm23, zmm23",
-            "kortestb k0, k0",
+            ev_dec!("r14", "ymm30", "ymm20", "ymm21", "ymm27", "ymm4"),
+            "vpermt2q ymm31, ymm28, ymm4",
+            "vmovdqu64 xmmword ptr [r15 + rbx], xmm31",
+            "vmovdqu64 ymmword ptr [r15 + rbx + {ING} - 16] {{k1}}, ymm31",
+            ev_st!("rbp", "r13", "ymm29", "ymm17", "ymm18", "xmm18", "ymm22", "", "42", "56", "57", ""),
+            "vpord ymm3, ymm27, ymm23",
+            "vptest ymm3, ymm3",
             "jnz 75f",
             "23:",
             "mov qword ptr [rsp], rbp",
@@ -2810,16 +2599,15 @@ unsafe fn ev_loop<S: EventSink>(p: *const u8, w: *mut i64, b: *mut EvBatch, cx: 
             ev_pur!("52", "53", "40", "r12", "rbp", ev_save_b, ev_restore_b),
             ev_pur!("54", "55", "41", "rbp", "r12", ev_save_b, ev_restore_b),
             ev_pur!("56", "57", "42", "r12", "rbp", ev_save_b, ev_restore_b),
-            ev_retry!("40", "rbp", "ymm9", "r12", "r13", ev_xy!("ymm29"), "ymm17", "ymm18", "xmm18", "ymm22", "", "72", "43", "44", "53"),
-            ev_retry!("41", "r12", "ymm11", "rbp", "r14", ev_xb!(), "ymm20", "ymm21", "xmm21", "ymm3", ev_ids_ab!(), "73", "58", "59", "55"),
-            ev_retry!("42", "rbp", "ymm9", "r12", "r13", ev_xy!("ymm29"), "ymm17", "ymm18", "xmm18", "ymm22", "", "74", "60", "61", "57"),
+            ev_retry!("40", "rbp", "ymm9", "r12", "r13", "ymm29", "ymm17", "ymm18", "xmm18", "ymm22", "", "72", "43", "44", "53"),
+            ev_retry!("41", "r12", "ymm11", "rbp", "r14", "ymm30", "ymm20", "ymm21", "xmm21", "ymm3", ev_ids_ab!(), "73", "58", "59", "55"),
+            ev_retry!("42", "rbp", "ymm9", "r12", "r13", "ymm29", "ymm17", "ymm18", "xmm18", "ymm22", "", "74", "60", "61", "57"),
             "72:",
             "mov rdi, rbp",
             "lea rsi, [r15 + rbx]",
             "mov eax, 1",
             "jmp 99f",
             "73:",
-            ev_dec!("r13", "ymm29", "ymm17", "ymm18", "ymm23", "ymm31"),
             "vmovdqa64 ymm0, ymm23",
             "vptest ymm0, ymm0",
             "jnz 78f",
@@ -2847,7 +2635,6 @@ unsafe fn ev_loop<S: EventSink>(p: *const u8, w: *mut i64, b: *mut EvBatch, cx: 
             "mov eax, 1",
             "jmp 99f",
             "74:",
-            "vextracti64x4 ymm27, zmm23, 1",
             "vmovdqa64 ymm0, ymm23",
             "vptest ymm0, ymm0",
             "jnz 78b",
@@ -2874,7 +2661,6 @@ unsafe fn ev_loop<S: EventSink>(p: *const u8, w: *mut i64, b: *mut EvBatch, cx: 
             "mov eax, 1",
             "jmp 99f",
             "75:",
-            "vextracti64x4 ymm27, zmm23, 1",
             ev_save_b!(),
             "mov rdi, qword ptr [rsp]",
             ev_next!(),
@@ -3013,7 +2799,7 @@ unsafe fn ev_loop<S: EventSink>(p: *const u8, w: *mut i64, b: *mut EvBatch, cx: 
             "vpmovmskb eax, ymm0",
             "tzcnt eax, eax",
             "vpxor xmm10, xmm10, xmm10",
-            ev_st!("r14", "r13", ev_xy!("ymm8"), "ymm9", "ymm10", "xmm0", "ymm11", "", "68", "66", "67", ""),
+            ev_st!("r14", "r13", "ymm8", "ymm9", "ymm10", "xmm0", "ymm11", "", "68", "66", "67", ""),
             "vmovdqa xmm12, xmm0",
             "vpunpckhqdq ymm1, ymm11, ymm11",
             "vpaddb ymm2, ymm1, ymmword ptr [rip + {EVC} + 96]",
@@ -3089,7 +2875,7 @@ unsafe fn ev_loop<S: EventSink>(p: *const u8, w: *mut i64, b: *mut EvBatch, cx: 
             out("zmm24") _, out("zmm25") _, out("zmm26") _, out("zmm27") _, out("zmm28") _, out("zmm29") _, out("zmm30") _, out("zmm31") _,
             out("k0") _, out("k1") _, out("k2") _, out("k3") _, out("k4") _, out("k5") _, out("k6") _, out("k7") _,
             T = sym T, TJL = sym TJL, EVC = sym EVC, EJ = sym EJ, K3 = sym K3, TL2 = sym TL2, PUC = sym PUC, FL = sym flush_ev::<S>, REDO = sym ev_redo::<S>, FIX = sym ev_fix::<S>,
-            PROD = const E_PROD, EJE = const EJ_E, TJP = sym TJP,
+            PROD = const E_PROD, EJE = const EJ_E,
             PP = const E_PP, EID = const E_EID, UID = const E_UID, ING = const E_ING, SCR = const E_SCR, NOFF = const E_N, PFD = const PFD,
         );
     }

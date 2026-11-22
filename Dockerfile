@@ -1,6 +1,6 @@
 # Submission image: the scorer builds this file. It mirrors fast2/Dockerfile; keep the two identical.
 # Build context: the repository root.
-FROM rust:1.99-slim-bookworm AS build
+FROM rust@sha256:6f14b2b4b278ec0d50aa1d69541c304ce0f95e0f6268487aa9924af1c2e9aebe AS build
 WORKDIR /src
 COPY fast2/Cargo.toml fast2/Cargo.lock ./
 COPY fast2/.cargo .cargo

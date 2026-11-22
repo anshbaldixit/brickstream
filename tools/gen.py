@@ -16,7 +16,9 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-IMAGE = "ss-gen"
+import os
+IMAGE = os.environ.get("GEN_IMAGE", "ss-gen")
+GEN_SRC = os.environ.get("GEN_SRC", "kit/generator/generator")
 
 
 def ensure_image():
@@ -24,7 +26,7 @@ def ensure_image():
         return
     print(f"building {IMAGE} ...", file=sys.stderr)
     subprocess.run(["docker", "build", "-t", IMAGE, "-f", str(ROOT / "tools" / "generator.Dockerfile"),
-                    str(ROOT / "kit" / "generator" / "generator")], check=True)
+                    str(ROOT / GEN_SRC)], check=True)
 
 
 def main():

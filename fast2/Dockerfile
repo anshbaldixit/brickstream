@@ -1,13 +1,12 @@
 # Shopping Sessions pipeline (Rust). Build context: the repository root.
 #   docker build -f fast2/Dockerfile -t ss:fast2 .
-FROM rust:1.99-alpine AS build
-RUN apk add --no-cache musl-dev
+FROM rust:1.99-slim-bookworm AS build
 WORKDIR /src
 COPY fast2/Cargo.toml fast2/Cargo.lock ./
 COPY fast2/.cargo .cargo
 COPY fast2/src src
-RUN cargo build --release --target x86_64-unknown-linux-musl \
- && cp target/x86_64-unknown-linux-musl/release/pipeline /pipeline
+RUN cargo build --release --target x86_64-unknown-linux-gnu \
+ && cp target/x86_64-unknown-linux-gnu/release/pipeline /pipeline
 
 FROM scratch
 COPY fast2/LICENSE /LICENSE

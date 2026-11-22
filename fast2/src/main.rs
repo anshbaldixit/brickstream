@@ -1,7 +1,6 @@
 #![allow(dead_code, static_mut_refs, unused_unsafe, unexpected_cfgs)]
 mod ckix;
 mod complex;
-mod cpuguard;
 mod core;
 mod events;
 mod iface;

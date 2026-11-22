@@ -1,4 +1,4 @@
-#![allow(dead_code, static_mut_refs, unused_unsafe)]
+#![allow(dead_code, static_mut_refs, unused_unsafe, unexpected_cfgs)]
 mod ckix;
 mod complex;
 mod core;
@@ -61,7 +61,7 @@ pub const fn env_u32(s: Option<&str>, d: u32) -> u32 {
         }
     }
 }
-pub const BB: u32 = env_u32(option_env!("XL_BB"), 14);
+pub const BB: u32 = env_u32(option_env!("XL_BB"), 15);
 pub const SPIN_US_DEFAULT: u64 = env_u32(option_env!("XL_SPIN_DEF"), 400) as u64;
 pub const BSIZE: usize = 1 << BB;
 pub const UB: u32 = env_u32(option_env!("XL_UB"), 12);
@@ -132,7 +132,7 @@ pub struct EdgeInfo {
 }
 
 pub struct TState {
-    pub ev: parse::Part,
+    pub ev: parse::EvPart,
     pub us: parse::Part,
     pub raws: Vec<(u64, u32)>,
     pub rawbuf: Vec<u8>,
@@ -148,7 +148,7 @@ pub struct TState {
     pub cx_raw: Vec<Rec>,
     pub cx_ev: Vec<Vec<Rec>>,
     pub cx_ck: Vec<Vec<[u64; 3]>>,
-    pub ck: Vec<[u64; 2]>,
+    pub ck: Vec<u64>,
     pub runbuf: Vec<Rec>,
     pub pend: Vec<(u32, u16)>,
     pub cnt: Vec<u32>,
@@ -250,12 +250,12 @@ impl G {
         }
     }
     #[inline(always)]
-    pub fn csr_range(&self, u: u32) -> &[[u64; 2]] {
+    pub fn csr_range(&self, u: u32) -> &[u64] {
         unsafe {
             let i = u as usize + (u as usize >> UB);
             let a = *self.csr_off.add(i) as usize;
             let b = *self.csr_off.add(i + 1) as usize;
-            std::slice::from_raw_parts(self.csr.add(a), b - a)
+            std::slice::from_raw_parts((self.csr as *const u64).add(a), b - a)
         }
     }
 }
@@ -289,7 +289,12 @@ pub fn shard(pkey: u64) -> usize {
 }
 
 fn main() {
+    sys::xm(1);
     let t0 = Instant::now();
+    #[cfg(feature = "sp")]
+    let sp_t0 = sys::sp::ns();
+    #[cfg(feature = "sp")]
+    sys::sp::snap("t0");
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(|s| s.as_str()) == Some("--generic") {
         let (data, outdir) = dirs(&args, 1);
@@ -297,6 +302,8 @@ fn main() {
     }
     let (data, outdir) = dirs(&args, 0);
     sys::exec_init(&args, &data, &outdir, ncpu_env());
+    sys::xm_page();
+    sys::fault_fallback_init();
     sys::fd_reserve();
     std::panic::set_hook(Box::new(|info| {
         eprintln!("[v2b] panic: {info}");
@@ -316,8 +323,13 @@ fn main() {
         sys::tl::T0_NS = sys::tl::realtime_ns() - t0.elapsed().as_nanos() as u64;
         sys::tl::LAPT.reserve(64);
     }
+    #[cfg(feature = "tl")]
+    sys::mp::ON.store(std::env::var("XL_MEMPROF").is_ok(), std::sync::atomic::Ordering::Relaxed);
     if std::env::var("XL_ALLOC").map_or(true, |v| v == "1") {
         sys::alloc_enable();
+    }
+    if let Some(v) = std::env::var("XL_DONATE").ok().and_then(|v| v.trim().parse::<usize>().ok()) {
+        sys::DONATE_DIV.store(v, std::sync::atomic::Ordering::Relaxed);
     }
     if std::env::var("XL_FIRST4K").is_ok_and(|v| v == "1") {
         sys::FIRST_SMALL.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -343,12 +355,23 @@ fn main() {
     if let Ok(v) = std::env::var("XL_RGREL") {
         out::REGION_UNMAP.store(v == "1", std::sync::atomic::Ordering::Relaxed);
     }
+    #[cfg(feature = "sp")]
+    parse::SPTOUCH.store(std::env::var("XL_SPTOUCH").is_ok(), std::sync::atomic::Ordering::Relaxed);
+    if std::env::var("XL_HOLD").is_ok_and(|v| v == "1") {
+        parse::HOLD_FREE.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
     if std::env::var("XL_PPARTS").is_ok_and(|v| v == "0") {
         sys::SETUP_PARTS.store(false, std::sync::atomic::Ordering::Relaxed);
     }
+    #[cfg(feature = "sp")]
+    sys::sp::snap("init");
+    sys::xm(7);
     if std::env::var("XL_POOL").map_or(true, |v| v == "1") {
         sys::pool_start(nt);
     }
+    sys::xm(8);
+    #[cfg(feature = "sp")]
+    sys::sp::snap("pool");
     let knob = |name: &str, default: bool| std::env::var(name).map_or(default, |v| v == "1");
     unsafe {
         parse::NT = knob("XL_NT", true);
@@ -380,7 +403,9 @@ fn main() {
         eprintln!("[memtest] {}", if sys::mem_test() { "OK" } else { "FAILED" });
         unsafe { sys::_exit(0) };
     }
+    sys::xm(9);
     let g: &'static mut G = Box::leak(Box::new(setup::setup(&data, nt, check)));
+    sys::xm(10);
     lap("setup");
     if std::env::var("XL_SORTBENCH").is_ok() {
         links::sort_bench(g);
@@ -390,10 +415,16 @@ fn main() {
         let gr: &G = g;
         run_par(nt, |tid| parse::stage1(gr, tid));
     }
+    sys::xm(11);
     lap("parse");
     links::stage2(g);
+    sys::xm(12);
     lap("st2sort");
+    if std::env::var("XL_OVL").map_or(true, |v| v != "0") {
+        out::s3_init(g, &outdir);
+    }
     events::stage3(g);
+    sys::xm(13);
     lap("ev3b");
     if std::env::var("XL_OVL").map_or(true, |v| v != "0") {
         out::stage45(g, &outdir);
@@ -404,6 +435,7 @@ fn main() {
         out::stage5(g, &outdir);
         lap("write");
     }
+    sys::xm(14);
     if timing || check {
         let mut s = String::new();
         for (n, ms) in unsafe { sys::LAPS.iter() } {
@@ -448,7 +480,8 @@ fn main() {
     let rel0 = sys::tl::now();
     let endrel = std::env::var("XL_ENDREL").ok();
     let many_faults = endrel.is_none() && sys::minflt(0) as usize > 2 * (g.files.last().map_or(0, |f| f.off + f.len) >> 16) + 60_000;
-    if ((sys::SMALLPAGES.load(std::sync::atomic::Ordering::Relaxed) || many_faults) && endrel.as_deref().map_or(true, |v| v == "1")) || endrel.as_deref() == Some("2") {
+    let endrel_ran = ((sys::SMALLPAGES.load(std::sync::atomic::Ordering::Relaxed) || many_faults) && endrel.as_deref().map_or(true, |v| v == "1")) || endrel.as_deref() == Some("2");
+    if endrel_ran {
         let nt = g.nt;
         let mut r = [[(0usize, 0usize); 12]; 16];
         for tid in 0..nt {
@@ -465,7 +498,7 @@ fn main() {
                 v(c.rev.as_ptr() as *const u8, c.rev.len() * 4),
                 v(c.cat.as_ptr(), c.cat.len()),
                 v(t.edge.as_ptr() as *const u8, t.edge.len() * 16),
-                if g.csr.is_null() { (0, 0) } else { v((g.csr as *const u8).wrapping_add(g.ncsr * 16 * tid / nt), g.ncsr * 16 * (tid + 1) / nt - g.ncsr * 16 * tid / nt) },
+                if g.csr.is_null() { (0, 0) } else { v((g.csr as *const u8).wrapping_add(g.ncsr * 8 * tid / nt), g.ncsr * 8 * (tid + 1) / nt - g.ncsr * 8 * tid / nt) },
                 if endrel.as_deref() == Some("2") { let tot = g.files.last().map_or(0, |f| f.off + f.len); v(g.region.wrapping_add(tot * tid / nt), tot * (tid + 1) / nt - tot * tid / nt) } else { (0, 0) },
                 (0, 0),
             ];
@@ -482,6 +515,14 @@ fn main() {
     }
     if timing {
         eprintln!("[v2b] exit at {:.1} ms", t0.elapsed().as_secs_f64() * 1e3);
+    }
+    #[cfg(feature = "sp")]
+    {
+        sys::sp::snap("endrel");
+        sys::sp::report();
+        let r = sys::sp::ru(0);
+        eprintln!("[sp] at report: user {:.2} sys {:.2} minflt {} t {:.2}", r[0] as f64 / 1e3, r[1] as f64 / 1e3, r[2], t0.elapsed().as_secs_f64() * 1e3);
+        eprintln!("[sp] mono {} {}", sp_t0, sys::sp::ns());
     }
     #[cfg(feature = "tl")]
     unsafe {
@@ -536,5 +577,10 @@ fn main() {
             for (kb, n) in v.iter().rev().take(12) { eprintln!("[dbg] rss {kb} kB {n}"); }
         }
     }
+    sys::xm(62);
+    if !endrel_ran && std::env::var("XL_XREL").map_or(true, |v| v != "0") {
+        sys::exit_release(g.nt, unsafe { &parse::FDS });
+    }
+    sys::xm_end();
     unsafe { sys::_exit(0) }
 }

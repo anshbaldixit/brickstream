@@ -12,7 +12,7 @@ pub static mut RELEASE: bool = true;
 pub static mut PREFETCH: bool = false;
 static POPW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 fn popw() -> bool {
-    *POPW.get_or_init(|| !std::env::var("XL_POPW").is_ok_and(|v| v == "0"))
+    *POPW.get_or_init(|| !std::env::var("XL_POPW").is_ok_and(|v| v == "0") && !(crate::sys::r3_on() && crate::sys::HUGE.load(Ordering::Relaxed) && !crate::sys::SMALLPAGES.load(Ordering::Relaxed)))
 }
 const MADV_POPULATE_WRITE: i32 = 23;
 #[cfg(feature = "knobs")]
@@ -30,7 +30,8 @@ struct Line([u64; 8]);
 
 pub struct Part {
     lines: Vec<Line>,
-    fill: Vec<u8>,
+    sbase: *mut u8,
+    fill: Vec<u32>,
     cur: Vec<*mut u64>,
     nch: Vec<u32>,
     n: Vec<u32>,
@@ -39,13 +40,17 @@ pub struct Part {
     blk: *mut u8,
     blk_end: *mut u8,
     popw: bool,
-    pend: Vec<Line>,
+    pend: Vec<u32>,
+    sink: *mut u64,
+    sink_buf: Vec<Line>,
 }
 const NOCHUNK: usize = LINK_OFF;
+pub const CK_STAGE: usize = 192;
+const _: () = assert!(LINK_OFF % CK_STAGE == 0 && 64 + CK_STAGE == 256 && CK_STAGE % 64 == 0 && CK_STAGE == EV_STAGE);
 unsafe impl Send for Part {}
 impl Part {
     pub fn empty() -> Part {
-        Part { lines: Vec::new(), fill: Vec::new(), cur: Vec::new(), nch: Vec::new(), n: Vec::new(), head: Vec::new(), arena: std::ptr::null(), blk: std::ptr::null_mut(), blk_end: std::ptr::null_mut(), popw: false, pend: Vec::new() }
+        Part { lines: Vec::new(), sbase: std::ptr::null_mut(), fill: Vec::new(), cur: Vec::new(), nch: Vec::new(), n: Vec::new(), head: Vec::new(), arena: std::ptr::null(), blk: std::ptr::null_mut(), blk_end: std::ptr::null_mut(), popw: false, pend: Vec::new(), sink: std::ptr::null_mut(), sink_buf: Vec::new() }
     }
     pub fn new_unbound(nb: usize) -> Part {
         Part::build(std::ptr::null(), nb)
@@ -57,10 +62,19 @@ impl Part {
         Part::build(arena, nb)
     }
     fn build(arena: *const Arena, nb: usize) -> Part {
+        let nbs = nb + 64;
+        if 256 * (nbs as u64 + 1) > u32::MAX as u64 {
+            fallback("too many user buckets");
+        }
+        let mut sink_buf = vec![Line([0; 8]); 2 * CHUNK / 64];
+        let sink = ((sink_buf.as_mut_ptr() as usize + CHUNK - 1) & !(CHUNK - 1)) as *mut u64;
+        let mut lines = vec![Line([0; 8]); 4 * nbs + 3];
+        let sbase = ((lines.as_mut_ptr() as usize + 255) & !255) as *mut u8;
         Part {
-            lines: vec![Line([0; 8]); nb],
-            fill: vec![0; nb + 64],
-            cur: vec![NOCHUNK as *mut u64; nb],
+            lines,
+            sbase,
+            fill: (0..nbs).map(ev_empty).collect(),
+            cur: vec![NOCHUNK as *mut u64; nbs],
             nch: vec![0; nb],
             n: vec![0; nb],
             head: vec![std::ptr::null_mut(); nb],
@@ -68,72 +82,117 @@ impl Part {
             blk: std::ptr::null_mut(),
             blk_end: std::ptr::null_mut(),
             popw: popw(),
-            pend: vec![Line([0; 8]); 72],
+            pend: vec![0; 72],
+            sink,
+            sink_buf,
         }
+    }
+    #[inline(always)]
+    pub fn sink_b(&self) -> u64 {
+        self.head.len() as u64
+    }
+    #[inline(always)]
+    pub unsafe fn push_all(&mut self, n: usize, ob: *const u64, rec: *const [u64; 2]) {
+        let fill = self.fill.as_mut_ptr();
+        let sb = self.sbase;
+        let pend = self.pend.as_mut_ptr();
+        let mut fpi: usize = 0;
+        let obe = ob.add(n) as *const u8;
+        let rce = rec.add(n) as *const u8;
+        let mut ix: isize = -8 * n as isize;
+        loop {
+            std::arch::asm!(
+                "test {ix:e}, 8",
+                "jz 2f",
+                "sub {ix}, 8",
+                "jmp 4f",
+                "2:",
+                "mov {b}, qword ptr [{obe} + {ix}]",
+                "mov {p:e}, dword ptr [{fill} + 4*{b}]",
+                "test {p:l}, {p:l}",
+                "jz 3f",
+                "vmovdqa {x}, xmmword ptr [{rce} + 2*{ix}]",
+                "vmovdqa xmmword ptr [{sb} + {p}], {x}",
+                "add {p:l}, 16",
+                "mov dword ptr [{fill} + 4*{b}], {p:e}",
+                "mov dword ptr [{pend} + 4*{fpi}], {b:e}",
+                "adc {fpi}, 0",
+                "4:",
+                "mov {b}, qword ptr [{obe} + {ix} + 8]",
+                "mov {p:e}, dword ptr [{fill} + 4*{b}]",
+                "test {p:l}, {p:l}",
+                "jz 5f",
+                "vmovdqa {x}, xmmword ptr [{rce} + 2*{ix} + 16]",
+                "vmovdqa xmmword ptr [{sb} + {p}], {x}",
+                "add {p:l}, 16",
+                "mov dword ptr [{fill} + 4*{b}], {p:e}",
+                "mov dword ptr [{pend} + 4*{fpi}], {b:e}",
+                "adc {fpi}, 0",
+                "add {ix}, 16",
+                "jnz 2b",
+                "jmp 3f",
+                "5:",
+                "add {ix}, 8",
+                "3:",
+                ix = inout(reg) ix, fpi = inout(reg) fpi, b = out(reg) _, p = out(reg) _, x = out(xmm_reg) _,
+                obe = in(reg) obe, rce = in(reg) rce, fill = in(reg) fill, sb = in(reg) sb, pend = in(reg) pend,
+                options(nostack)
+            );
+            if ix == 0 {
+                break;
+            }
+            self.flush_full(pend, fpi);
+            fpi = 0;
+        }
+        self.flush_lines(pend, fpi);
     }
     #[inline(always)]
     pub fn push(&mut self, b: usize, w0: u64, w1: u64) {
         unsafe {
             let fp = self.fill.as_mut_ptr().add(b);
-            let f = *fp as usize;
-            let l = self.lines.as_mut_ptr().add(b) as *mut u64;
-            *l.byte_add(f) = w0;
-            *l.byte_add(f + 8) = w1;
-            if f == 48 {
-                *fp = 0;
-                self.flush(b, l);
-            } else {
-                *fp = (f + 16) as u8;
+            let f = *fp;
+            let l = self.sbase.add(f as usize) as *mut u64;
+            *l = w0;
+            *l.add(1) = w1;
+            let t = (f & !255) | ((f + 16) & 255);
+            *fp = t;
+            if t & 255 == 0 {
+                self.flush_one(b);
             }
         }
     }
-    pub fn lines_ptr(&self) -> *const u8 {
-        self.lines.as_ptr() as *const u8
-    }
     #[inline(always)]
-    pub unsafe fn push_many(&mut self, m: u64, n: usize, ob: *const u64, lp: *const u64, rec: *const [u64; 2]) {
+    pub unsafe fn push_many(&mut self, m: u64, n: usize, ob: *const u64, rec: *const [u64; 2]) {
         use std::arch::x86_64::*;
+        let _ = n;
         let fill = self.fill.as_mut_ptr();
-        let full = self.pend.as_mut_ptr() as *mut u64;
-        let mut fp = full;
-        macro_rules! row {
-            ($i:expr) => {{
-                let i = $i;
-                let l = *lp.add(i) as *mut u8;
-                let b = *ob.add(i) as usize;
-                let mut f = *fill.add(b) as usize;
-                if f == 64 {
-                    self.flush_full(full, fp.offset_from(full) as usize);
-                    fp = full;
-                    f = 0;
-                }
-                _mm_store_si128(l.add(f) as *mut __m128i, _mm_load_si128(rec.add(i) as *const __m128i));
-                let t = f + 16;
-                *fill.add(b) = t as u8;
-                *fp = b as u64;
-                fp = fp.add(t >> 6);
-            }};
-        }
-        if m == (if n >= 64 { !0 } else { (1u64 << n) - 1 }) {
-            for i in 0..n {
-                row!(i);
+        let sb = self.sbase;
+        let pend = self.pend.as_mut_ptr();
+        let mut fpi: usize = 0;
+        let mut m = m;
+        while m != 0 {
+            let i = m.trailing_zeros() as usize;
+            m &= m - 1;
+            let b = *ob.add(i) as usize;
+            let mut f = *fill.add(b);
+            if f & 255 == 0 {
+                self.flush_full(pend, fpi);
+                fpi = 0;
+                f = *fill.add(b);
             }
-        } else {
-            let mut m = m;
-            while m != 0 {
-                let i = m.trailing_zeros() as usize;
-                m &= m - 1;
-                row!(i);
-            }
+            _mm_store_si128(sb.add(f as usize) as *mut __m128i, _mm_load_si128(rec.add(i) as *const __m128i));
+            let t = (f & !255) | ((f + 16) & 255);
+            *fill.add(b) = t;
+            *pend.add(fpi) = b as u32;
+            fpi += (t & 255 == 0) as usize;
         }
-        self.flush_lines(full, fp.offset_from(full) as usize);
+        self.flush_lines(pend, fpi);
     }
     #[inline(always)]
-    unsafe fn flush_lines(&mut self, full: *const u64, k: usize) {
-        const _: () = assert!(LINK_OFF + 64 == CHUNK);
+    unsafe fn flush_lines(&mut self, full: *const u32, k: usize) {
         let cur = self.cur.as_mut_ptr();
         let fill = self.fill.as_mut_ptr();
-        let lines = self.lines.as_ptr() as *const u8;
+        let sb = self.sbase;
         macro_rules! flush {
             ($nt:literal) => {{
                 let mut j = 0;
@@ -141,12 +200,12 @@ impl Part {
                     let b = *full.add(j) as usize;
                     let cp = cur.add(b);
                     let mut c = *cp;
-                    if (c as usize).wrapping_add(64) & (CHUNK - 1) == 0 {
+                    if (c as usize) & (CHUNK - 1) == LINK_OFF {
                         c = self.new_chunk(b, c);
                     }
-                    line_out::<$nt>(c as *mut u8, lines.add(64 * b));
-                    *cp = c.add(8);
-                    *fill.add(b) = 0;
+                    block_out::<$nt>(c as *mut u8, sb.add(256 * b + 64));
+                    *cp = c.add(CK_STAGE / 8);
+                    *fill.add(b) = ev_empty(b);
                     j += 1;
                 }
             }};
@@ -159,31 +218,27 @@ impl Part {
     }
     #[cold]
     #[inline(never)]
-    unsafe fn flush_full(&mut self, full: *const u64, k: usize) {
+    unsafe fn flush_full(&mut self, full: *const u32, k: usize) {
         self.flush_lines(full, k)
     }
-    #[inline(always)]
-    unsafe fn flush(&mut self, b: usize, l: *mut u64) {
-        let cp = self.cur.as_mut_ptr().add(b);
-        let mut c = *cp;
-        if (c as usize & (CHUNK - 1)) == LINK_OFF {
-            c = self.new_chunk(b, c);
-        }
-        if NT {
-            line_out::<true>(c as *mut u8, l as *const u8);
-        } else {
-            line_out::<false>(c as *mut u8, l as *const u8);
-        }
-        *cp = c.add(8);
+    #[inline(never)]
+    unsafe fn flush_one(&mut self, b: usize) {
+        let full = [b as u32];
+        self.flush_lines(full.as_ptr(), 1);
     }
     #[inline(never)]
     unsafe fn new_chunk(&mut self, b: usize, old: *mut u64) -> *mut u64 {
+        if b >= self.head.len() {
+            return self.sink;
+        }
         if self.blk == self.blk_end {
             self.blk = (*self.arena).alloc(BLOCK);
             self.blk_end = self.blk.add(BLOCK);
             if self.popw {
                 madvise(self.blk, BLOCK, MADV_POPULATE_WRITE);
             }
+            #[cfg(feature = "sp")]
+            crate::sys::sp::zero_touch(self.blk);
         }
         let n = self.blk as *mut u64;
         self.blk = self.blk.add(CHUNK);
@@ -198,15 +253,15 @@ impl Part {
     pub fn finish(&mut self) {
         unsafe {
             for b in 0..self.head.len() {
-                let f = self.fill[b] as usize / 8;
+                let f = (self.fill[b].wrapping_sub(64) & 255) as usize;
                 if f > 0 {
                     let mut c = self.cur[b];
                     if (c as usize & (CHUNK - 1)) == LINK_OFF {
                         c = self.new_chunk(b, c);
                     }
-                    std::ptr::copy_nonoverlapping(self.lines.as_ptr().add(b) as *const u64, c, f);
-                    self.cur[b] = c.add(f);
-                    self.fill[b] = 0;
+                    std::ptr::copy_nonoverlapping(self.sbase.add(256 * b + 64), c as *mut u8, f);
+                    self.cur[b] = (c as *mut u8).add(f) as *mut u64;
+                    self.fill[b] = ev_empty(b);
                 }
                 self.n[b] = if self.head[b].is_null() {
                     0
@@ -255,17 +310,438 @@ impl Part {
     }
 }
 
+pub const EV_STAGE: usize = 192;
+const EV_FULL: usize = 64 + EV_STAGE;
+const _: () = assert!(LINK_OFF % EV_STAGE == 0 && EV_FULL == 256 && EV_STAGE % 64 == 0);
+pub const R12: bool = crate::env_u32(option_env!("XL_R12"), 1) == 1;
+pub const EV_REC: usize = if R12 { 12 } else { 16 };
+pub const R12_M59: u64 = (1 << 59) - 1;
+pub const R12_UMAX: u64 = 1 << 22;
+const _: () = assert!(EV_STAGE % EV_REC == 0 && LINK_OFF % EV_REC == 0 && BB <= 15 && ING_MAX < (1 << 21) && NALIAS <= 16);
+const R12_NULL: bool = crate::env_u32(option_env!("XL_R12NULL"), 0) == 1;
 #[inline(always)]
-#[cfg(target_feature = "avx512ifma")]
-pub(crate) unsafe fn mul8(a: std::arch::x86_64::__m512i, b: std::arch::x86_64::__m512i) -> std::arch::x86_64::__m512i {
-    use std::arch::x86_64::*;
-    // Every caller reduces the product modulo 2^40. A 52-bit low multiply
-    // preserves those bits and processes all eight identifiers together.
-    _mm512_madd52lo_epu64(_mm512_setzero_si512(), a, b)
+pub fn r12_null(slot: u64) -> u64 {
+    slot | ING_MAX << 16
+}
+#[inline(always)]
+pub unsafe fn dec12(e: *const u8) -> Rec {
+    let q = (e as *const u64).read_unaligned();
+    let h = (e.add(8) as *const u32).read_unaligned() as u64;
+    Rec { w0: h << 32 | q >> 59, w1: q & R12_M59 }
+}
+const ESC_CHUNK: usize = 1024;
+const SHCH: bool = crate::env_u32(option_env!("XL_SHCH"), 0) == 1;
+const ESC_LINK: usize = 1008;
+pub struct EvPart {
+    stage: Vec<Line>,
+    sbase: *mut u8,
+    fill: Vec<u32>,
+    cur: Vec<*mut u64>,
+    nch: Vec<u32>,
+    n: Vec<u32>,
+    head: Vec<*mut u64>,
+    arena: *const Arena,
+    blk: *mut u8,
+    blk_end: *mut u8,
+    popw: bool,
+    pend: Vec<u32>,
+    esc_head: Vec<*mut u8>,
+    esc_cur: Vec<*mut u8>,
+    esc_next: *mut u8,
+    sink: *mut u64,
+    sink_buf: Vec<Line>,
+    esc_pend: Vec<[u64; 3]>,
+}
+unsafe impl Send for EvPart {}
+#[inline(always)]
+const fn ev_empty(b: usize) -> u32 {
+    (256 * b + 64) as u32
+}
+impl EvPart {
+    pub fn empty() -> EvPart {
+        EvPart { stage: Vec::new(), sbase: std::ptr::null_mut(), fill: Vec::new(), cur: Vec::new(), nch: Vec::new(), n: Vec::new(), head: Vec::new(), arena: std::ptr::null(), blk: std::ptr::null_mut(), blk_end: std::ptr::null_mut(), popw: false, pend: Vec::new(), esc_head: Vec::new(), esc_cur: Vec::new(), esc_next: std::ptr::null_mut(), sink: std::ptr::null_mut(), sink_buf: Vec::new(), esc_pend: Vec::new() }
+    }
+    pub fn new_unbound(nb: usize) -> EvPart {
+        EvPart::build(std::ptr::null(), nb)
+    }
+    pub fn set_arena(&mut self, arena: &Arena) {
+        self.arena = arena;
+    }
+    pub fn new(arena: &Arena, nb: usize) -> EvPart {
+        EvPart::build(arena, nb)
+    }
+    fn build(arena: *const Arena, nb: usize) -> EvPart {
+        const _: () = assert!(EV_STAGE == 192 && (EV_REC == 12 || EV_REC == 16));
+        let nbs = nb + R12 as usize;
+        if 256 * (nbs as u64 + 1) > u32::MAX as u64 {
+            fallback("too many event buckets");
+        }
+        let mut sink_buf = if R12 { vec![Line([0; 8]); 2 * CHUNK / 64] } else { Vec::new() };
+        let sink = if R12 { ((sink_buf.as_mut_ptr() as usize + CHUNK - 1) & !(CHUNK - 1)) as *mut u64 } else { std::ptr::null_mut() };
+        let mut stage = vec![Line([0; 8]); 4 * nbs + 3];
+        let sbase = ((stage.as_mut_ptr() as usize + 255) & !255) as *mut u8;
+        EvPart {
+            stage,
+            sbase,
+            fill: (0..nbs).map(ev_empty).collect(),
+            cur: vec![NOCHUNK as *mut u64; nbs],
+            nch: vec![0; nb],
+            n: vec![0; nb],
+            head: vec![std::ptr::null_mut(); nb],
+            arena,
+            blk: std::ptr::null_mut(),
+            blk_end: std::ptr::null_mut(),
+            popw: popw(),
+            pend: vec![0; 72],
+            esc_head: vec![std::ptr::null_mut(); if R12 { nb } else { 0 }],
+            esc_cur: vec![ESC_LINK as *mut u8; if R12 { nb } else { 0 }],
+            esc_next: std::ptr::null_mut(),
+            sink,
+            sink_buf,
+            esc_pend: Vec::with_capacity(if R12 { 64 } else { 0 }),
+        }
+    }
+    #[inline(always)]
+    pub fn sink_b(&self) -> u64 {
+        self.head.len() as u64
+    }
+    #[inline(always)]
+    fn block(&self, b: usize) -> *const u8 {
+        unsafe { self.sbase.add(256 * b + 64) }
+    }
+    #[inline(always)]
+    pub fn push(&mut self, b: usize, w0: u64, w1: u64) {
+        if R12 {
+            return self.push_esc(b, w0, w1);
+        }
+        unsafe {
+            let fp = self.fill.as_mut_ptr().add(b);
+            let f = *fp;
+            let l = self.sbase.add(f as usize) as *mut u64;
+            *l = w0;
+            *l.add(1) = w1;
+            let t = (f & !255) | ((f + 16) & 255);
+            *fp = t;
+            if t & 255 == 0 {
+                self.flush_one(b);
+            }
+        }
+    }
+    #[inline(always)]
+    pub unsafe fn push_many(&mut self, m: u64, n: usize, ob: *const u64, rec: *const [u64; 2]) {
+        use std::arch::x86_64::*;
+        let fill = self.fill.as_mut_ptr();
+        let sb = self.sbase;
+        let pend = self.pend.as_mut_ptr();
+        let mut fpi: usize = 0;
+        if n != 0 && m == (if n >= 64 { !0 } else { (1u64 << n) - 1 }) {
+            let obe = ob.add(n) as *const u8;
+            let rce = rec.add(n) as *const u8;
+            let mut ix: isize = -8 * n as isize;
+            loop {
+                if R12 {
+                    std::arch::asm!(
+                        "test {ix:e}, 8",
+                        "jz 2f",
+                        "sub {ix}, 8",
+                        "jmp 4f",
+                        "2:",
+                        "mov {b:e}, dword ptr [{rce} + 2*{ix} + 12]",
+                        "mov {p:e}, dword ptr [{fill} + 4*{b}]",
+                        "test {p:l}, {p:l}",
+                        "jz 3f",
+                        "vmovdqa {x}, xmmword ptr [{rce} + 2*{ix}]",
+                        "vmovdqu8 xmmword ptr [{sb} + {p}] {{{k}}}, {x}",
+                        "add {p:l}, 12",
+                        "mov dword ptr [{fill} + 4*{b}], {p:e}",
+                        "mov dword ptr [{pend} + 4*{fpi}], {b:e}",
+                        "adc {fpi}, 0",
+                        "4:",
+                        "mov {b:e}, dword ptr [{rce} + 2*{ix} + 28]",
+                        "mov {p:e}, dword ptr [{fill} + 4*{b}]",
+                        "test {p:l}, {p:l}",
+                        "jz 5f",
+                        "vmovdqa {x}, xmmword ptr [{rce} + 2*{ix} + 16]",
+                        "vmovdqu8 xmmword ptr [{sb} + {p}] {{{k}}}, {x}",
+                        "add {p:l}, 12",
+                        "mov dword ptr [{fill} + 4*{b}], {p:e}",
+                        "mov dword ptr [{pend} + 4*{fpi}], {b:e}",
+                        "adc {fpi}, 0",
+                        "add {ix}, 16",
+                        "jnz 2b",
+                        "jmp 3f",
+                        "5:",
+                        "add {ix}, 8",
+                        "3:",
+                        ix = inout(reg) ix, fpi = inout(reg) fpi, b = out(reg) _, p = out(reg) _, x = out(xmm_reg) _,
+                        rce = in(reg) rce, fill = in(reg) fill, sb = in(reg) sb, pend = in(reg) pend, k = in(kreg) 0x0FFFu16,
+                        options(nostack)
+                    );
+                } else {
+                    std::arch::asm!(
+                        "2:",
+                        "mov {b}, qword ptr [{obe} + {ix}]",
+                        "mov {p:e}, dword ptr [{fill} + 4*{b}]",
+                        "test {p:l}, {p:l}",
+                        "jz 3f",
+                        "vmovdqa {x}, xmmword ptr [{rce} + 2*{ix}]",
+                        "vmovdqu xmmword ptr [{sb} + {p}], {x}",
+                        "add {p:l}, 16",
+                        "mov dword ptr [{fill} + 4*{b}], {p:e}",
+                        "mov dword ptr [{pend} + 4*{fpi}], {b:e}",
+                        "adc {fpi}, 0",
+                        "add {ix}, 8",
+                        "jnz 2b",
+                        "3:",
+                        ix = inout(reg) ix, fpi = inout(reg) fpi, b = out(reg) _, p = out(reg) _, x = out(xmm_reg) _,
+                        obe = in(reg) obe, rce = in(reg) rce, fill = in(reg) fill, sb = in(reg) sb, pend = in(reg) pend,
+                        options(nostack)
+                    );
+                }
+                if ix == 0 {
+                    break;
+                }
+                self.flush_full(pend, fpi);
+                fpi = 0;
+            }
+        } else {
+            let mut m = m;
+            while m != 0 {
+                let i = m.trailing_zeros() as usize;
+                m &= m - 1;
+                let b = if R12 { ((*rec.add(i))[1] >> 32) as usize } else { *ob.add(i) as usize };
+                let mut f = *fill.add(b);
+                if f & 255 == 0 {
+                    self.flush_full(pend, fpi);
+                    fpi = 0;
+                    f = *fill.add(b);
+                }
+                let x = _mm_load_si128(rec.add(i) as *const __m128i);
+                if R12 {
+                    _mm_mask_storeu_epi8(sb.add(f as usize) as *mut i8, 0x0FFF, x);
+                } else {
+                    _mm_storeu_si128(sb.add(f as usize) as *mut __m128i, x);
+                }
+                let t = (f & !255) | ((f + EV_REC as u32) & 255);
+                *fill.add(b) = t;
+                *pend.add(fpi) = b as u32;
+                fpi += (t & 255 == 0) as usize;
+            }
+        }
+        self.flush_lines(pend, fpi);
+    }
+    #[inline(always)]
+    unsafe fn flush_lines(&mut self, full: *const u32, k: usize) {
+        let cur = self.cur.as_mut_ptr();
+        let fill = self.fill.as_mut_ptr();
+        let sb = self.sbase;
+        macro_rules! flush {
+            ($nt:literal) => {{
+                let mut j = 0;
+                while j != k {
+                    let b = *full.add(j) as usize;
+                    let cp = cur.add(b);
+                    let mut c = *cp;
+                    if (c as usize) & (CHUNK - 1) == LINK_OFF {
+                        c = self.new_chunk(b, c);
+                    }
+                    block_out::<$nt>(c as *mut u8, sb.add(256 * b + 64));
+                    *cp = c.add(EV_STAGE / 8);
+                    *fill.add(b) = ev_empty(b);
+                    j += 1;
+                }
+            }};
+        }
+        if NT {
+            flush!(true)
+        } else {
+            flush!(false)
+        }
+    }
+    #[cold]
+    #[inline(never)]
+    unsafe fn flush_full(&mut self, full: *const u32, k: usize) {
+        self.flush_lines(full, k)
+    }
+    #[inline(never)]
+    unsafe fn flush_one(&mut self, b: usize) {
+        let full = [b as u32];
+        self.flush_lines(full.as_ptr(), 1);
+    }
+    #[inline(always)]
+    unsafe fn take4k(&mut self) -> *mut u8 {
+        if SHCH {
+            let n = (*self.arena).alloc(CHUNK);
+            if self.popw && (n as usize) & (BLOCK - 1) == 0 {
+                madvise(n, BLOCK, MADV_POPULATE_WRITE);
+            }
+            return n;
+        }
+        if self.blk == self.blk_end {
+            self.blk = (*self.arena).alloc(BLOCK);
+            self.blk_end = self.blk.add(BLOCK);
+            if self.popw {
+                madvise(self.blk, BLOCK, MADV_POPULATE_WRITE);
+            }
+            #[cfg(feature = "sp")]
+            crate::sys::sp::zero_touch(self.blk);
+        }
+        let n = self.blk;
+        self.blk = self.blk.add(CHUNK);
+        n
+    }
+    #[inline(never)]
+    unsafe fn new_chunk(&mut self, b: usize, old: *mut u64) -> *mut u64 {
+        if b == self.head.len() {
+            return self.sink;
+        }
+        let n = self.take4k() as *mut u64;
+        if old as usize == NOCHUNK {
+            self.head[b] = n;
+        } else {
+            *(old as *mut usize) = n as usize;
+        }
+        self.nch[b] += 1;
+        n
+    }
+    #[inline(always)]
+    pub fn push_esc(&mut self, b: usize, w0: u64, w1: u64) {
+        unsafe {
+            let mut c = *self.esc_cur.get_unchecked(b);
+            if (c as usize) & (ESC_CHUNK - 1) == ESC_LINK {
+                c = self.esc_chunk(b, c);
+            }
+            *(c as *mut u64) = w0;
+            *(c.add(8) as *mut u64) = w1;
+            *self.esc_cur.get_unchecked_mut(b) = c.add(16);
+        }
+    }
+    #[inline(always)]
+    pub fn esc_defer(&mut self, b: usize, w0: u64, w1: u64) {
+        unsafe {
+            let c = *self.esc_cur.get_unchecked(b);
+            std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_ET0 }>(c as *const i8);
+            let n = self.esc_pend.len();
+            *self.esc_pend.as_mut_ptr().add(n) = [b as u64, w0, w1];
+            self.esc_pend.set_len(n + 1);
+        }
+    }
+    #[inline(always)]
+    pub fn esc_flush(&mut self) {
+        for i in 0..self.esc_pend.len() {
+            let [b, w0, w1] = unsafe { *self.esc_pend.get_unchecked(i) };
+            self.push_esc(b as usize, w0, w1);
+        }
+        unsafe { self.esc_pend.set_len(0) };
+    }
+    #[cold]
+    #[inline(never)]
+    unsafe fn esc_chunk(&mut self, b: usize, c: *mut u8) -> *mut u8 {
+        if (self.esc_next as usize) & (CHUNK - 1) == 0 {
+            self.esc_next = self.take4k();
+        }
+        let n = self.esc_next;
+        self.esc_next = n.add(ESC_CHUNK);
+        if c as usize == ESC_LINK {
+            self.esc_head[b] = n;
+        } else {
+            *(c as *mut usize) = n as usize;
+        }
+        n
+    }
+    #[inline(always)]
+    pub fn for_each_esc(&self, b: usize, mut f: impl FnMut(&[Rec])) {
+        unsafe {
+            if !R12 || b >= self.esc_head.len() {
+                return;
+            }
+            let mut c = self.esc_head[b];
+            if c.is_null() {
+                return;
+            }
+            let cur = self.esc_cur[b] as usize;
+            let last = (cur - 1) & !(ESC_CHUNK - 1);
+            loop {
+                if c as usize == last {
+                    f(std::slice::from_raw_parts(c as *const Rec, (cur - last) / 16));
+                    break;
+                }
+                let next = *(c.add(ESC_LINK) as *const usize) as *mut u8;
+                f(std::slice::from_raw_parts(c as *const Rec, ESC_LINK / 16));
+                c = next;
+            }
+        }
+    }
+    pub fn for_each_rec(&self, b: usize, mut f: impl FnMut(Rec)) {
+        self.for_each_raw(b, |p, n| {
+            for i in 0..n {
+                unsafe {
+                    f(if R12 { dec12(p.add(EV_REC * i)) } else { *(p as *const Rec).add(i) });
+                }
+            }
+        });
+        self.for_each_esc(b, |recs| recs.iter().for_each(|&r| f(r)));
+    }
+    pub fn finish(&mut self) {
+        unsafe {
+            for b in 0..self.head.len() {
+                let f = (self.fill[b].wrapping_sub(64) & 255) as usize;
+                if f > 0 {
+                    let mut c = self.cur[b];
+                    if (c as usize & (CHUNK - 1)) == LINK_OFF {
+                        c = self.new_chunk(b, c);
+                    }
+                    std::ptr::copy_nonoverlapping(self.block(b), c as *mut u8, f);
+                    self.cur[b] = (c as *mut u8).add(f) as *mut u64;
+                    self.fill[b] = ev_empty(b);
+                }
+                self.n[b] = if self.head[b].is_null() {
+                    0
+                } else {
+                    let cur = self.cur[b] as usize;
+                    let last = (cur - 1) & !(CHUNK - 1);
+                    (self.nch[b] - 1) * (LINK_OFF / EV_REC) as u32 + ((cur - last) / EV_REC) as u32
+                };
+            }
+            if NT {
+                std::arch::x86_64::_mm_sfence();
+            }
+        }
+    }
+    #[inline(always)]
+    pub fn for_each_raw(&self, b: usize, mut f: impl FnMut(*const u8, usize)) {
+        unsafe {
+            if b >= self.head.len() {
+                return;
+            }
+            let mut c = self.head[b];
+            if c.is_null() {
+                return;
+            }
+            let cur = self.cur[b] as usize;
+            let last = (cur - 1) & !(CHUNK - 1);
+            loop {
+                if c as usize == last {
+                    f(c as *const u8, (cur - last) / EV_REC);
+                    break;
+                }
+                let next = *((c as usize + LINK_OFF) as *const usize) as *mut u64;
+                f(c as *const u8, LINK_OFF / EV_REC);
+                c = next;
+            }
+        }
+    }
+    #[inline(always)]
+    pub fn for_each(&self, b: usize, mut f: impl FnMut(&[Rec])) {
+        assert!(!R12);
+        self.for_each_raw(b, |p, n| f(unsafe { std::slice::from_raw_parts(p as *const Rec, n) }));
+    }
+    pub fn count(&self, b: usize) -> usize {
+        self.n[b] as usize
+    }
 }
 
 #[inline(always)]
-#[cfg(not(target_feature = "avx512ifma"))]
 pub(crate) unsafe fn mul8(a: std::arch::x86_64::__m512i, b: std::arch::x86_64::__m512i) -> std::arch::x86_64::__m512i {
     use std::arch::x86_64::*;
     let m = |x: __m256i, y: __m256i| {
@@ -298,6 +774,22 @@ fn kor(a: u8, b: u8) -> u8 {
     o
 }
 #[inline(always)]
+unsafe fn mcmp<const S: bool, const PRED: i32>(k: u8, a: std::arch::x86_64::__m256i, b: std::arch::x86_64::__m256i) -> u8 {
+    let o: u8;
+    if S {
+        std::arch::asm!("vpcmpq {o} {{{k}}}, {a:y}, {b:y}, {p}", o = lateout(kreg) o, k = in(kreg) k, a = in(zmm_reg) a, b = in(zmm_reg) b, p = const PRED, options(pure, nomem, nostack, preserves_flags));
+    } else {
+        std::arch::asm!("vpcmpuq {o} {{{k}}}, {a:y}, {b:y}, {p}", o = lateout(kreg) o, k = in(kreg) k, a = in(zmm_reg) a, b = in(zmm_reg) b, p = const PRED, options(pure, nomem, nostack, preserves_flags));
+    }
+    o
+}
+#[inline(always)]
+fn kand(a: u8, b: u8) -> u8 {
+    let o: u8;
+    unsafe { std::arch::asm!("kandb {o}, {a}, {b}", o = lateout(kreg) o, a = in(kreg) a, b = in(kreg) b, options(pure, nomem, nostack, preserves_flags)) };
+    o
+}
+#[inline(always)]
 fn kandn(a: u8, b: u8) -> u8 {
     let o: u8;
     unsafe { std::arch::asm!("kandnb {o}, {a}, {b}", o = lateout(kreg) o, a = in(kreg) a, b = in(kreg) b, options(pure, nomem, nostack, preserves_flags)) };
@@ -308,14 +800,6 @@ unsafe fn st4<const D: usize>(a: *mut u8, i: usize, v: std::arch::x86_64::__m256
     std::arch::asm!("vmovdqa ymmword ptr [{a} + 8*{i} + {d}], {v}", a = in(reg) a, i = in(reg) i, d = const D, v = in(ymm_reg) v, options(nostack, preserves_flags));
 }
 #[inline(always)]
-#[cfg(target_feature = "avx512ifma")]
-unsafe fn mul4m<const D: usize>(base: *const u8, j: usize, b: std::arch::x86_64::__m256i) -> std::arch::x86_64::__m256i {
-    use std::arch::x86_64::*;
-    mul4(_mm256_load_si256(base.add(j * 8 + D).cast()), b)
-}
-
-#[inline(always)]
-#[cfg(not(target_feature = "avx512ifma"))]
 unsafe fn mul4m<const D: usize>(base: *const u8, j: usize, b: std::arch::x86_64::__m256i) -> std::arch::x86_64::__m256i {
     let o: std::arch::x86_64::__m256i;
     std::arch::asm!(
@@ -326,14 +810,24 @@ unsafe fn mul4m<const D: usize>(base: *const u8, j: usize, b: std::arch::x86_64:
     o
 }
 #[inline(always)]
-#[cfg(target_feature = "avx512ifma")]
-unsafe fn mul4(a: std::arch::x86_64::__m256i, b: std::arch::x86_64::__m256i) -> std::arch::x86_64::__m256i {
-    use std::arch::x86_64::*;
-    _mm256_madd52lo_epu64(_mm256_setzero_si256(), a, b)
+fn hide(v: std::arch::x86_64::__m256i) -> std::arch::x86_64::__m256i {
+    let r: std::arch::x86_64::__m256i;
+    unsafe { std::arch::asm!("/* {r:y} */", r = inout(zmm_reg) v => r, options(pure, nomem, nostack, preserves_flags)) };
+    r
 }
-
 #[inline(always)]
-#[cfg(not(target_feature = "avx512ifma"))]
+unsafe fn blendm(k: u8, a: std::arch::x86_64::__m256i, b: std::arch::x86_64::__m256i) -> std::arch::x86_64::__m256i {
+    let r: std::arch::x86_64::__m256i;
+    std::arch::asm!("vpblendmq {r:y} {{{k}}}, {a:y}, {b:y}", r = lateout(zmm_reg) r, k = in(kreg) k, a = in(zmm_reg) a, b = in(zmm_reg) b, options(pure, nomem, nostack, preserves_flags));
+    r
+}
+#[inline(always)]
+unsafe fn mulu(a: std::arch::x86_64::__m256i, b: std::arch::x86_64::__m256i) -> std::arch::x86_64::__m256i {
+    let r: std::arch::x86_64::__m256i;
+    std::arch::asm!("vpmuludq {r:y}, {a:y}, {b:y}", r = lateout(zmm_reg) r, a = in(zmm_reg) a, b = in(zmm_reg) b, options(pure, nomem, nostack, preserves_flags));
+    r
+}
+#[inline(always)]
 unsafe fn mul4(a: std::arch::x86_64::__m256i, b: std::arch::x86_64::__m256i) -> std::arch::x86_64::__m256i {
     let r: std::arch::x86_64::__m256i;
     std::arch::asm!("vpmullq {r}, {x}, {y}", r = lateout(ymm_reg) r, x = in(ymm_reg) a, y = in(ymm_reg) b, options(pure, nomem, nostack, preserves_flags));
@@ -359,6 +853,32 @@ unsafe fn line_out<const NT: bool>(dst: *mut u8, src: *const u8) {
             a = out(ymm_reg) _, b = out(ymm_reg) _, s = in(reg) src, d = in(reg) dst,
             options(nostack, preserves_flags)
         );
+    }
+}
+#[inline(always)]
+unsafe fn block_out<const NT: bool>(dst: *mut u8, src: *const u8) {
+    const _: () = assert!(EV_STAGE == 192);
+    if NT {
+        std::arch::asm!(
+            "vmovdqa {a}, ymmword ptr [{s}]",
+            "vmovdqa {b}, ymmword ptr [{s} + 32]",
+            "vmovntdq ymmword ptr [{d}], {a}",
+            "vmovntdq ymmword ptr [{d} + 32], {b}",
+            "vmovdqa {a}, ymmword ptr [{s} + 64]",
+            "vmovdqa {b}, ymmword ptr [{s} + 96]",
+            "vmovntdq ymmword ptr [{d} + 64], {a}",
+            "vmovntdq ymmword ptr [{d} + 96], {b}",
+            "vmovdqa {a}, ymmword ptr [{s} + 128]",
+            "vmovdqa {b}, ymmword ptr [{s} + 160]",
+            "vmovntdq ymmword ptr [{d} + 128], {a}",
+            "vmovntdq ymmword ptr [{d} + 160], {b}",
+            a = out(ymm_reg) _, b = out(ymm_reg) _, s = in(reg) src, d = in(reg) dst,
+            options(nostack, preserves_flags)
+        );
+    } else {
+        for k in 0..3 {
+            line_out::<false>(dst.add(64 * k), src.add(64 * k));
+        }
     }
 }
 #[inline(always)]
@@ -540,12 +1060,13 @@ impl<'a> Ctx<'a> {
             return;
         }
         let g = self.g;
-        let p = EvP { ing_base: g.ing_base, ws: g.ws, wlen: g.wlen, ukey: g.ukey, ekey: g.ekey, ucap: g.ucap, ecap: g.ecap, ptab: self.tabs.prod.as_ptr(), lines: self.t.ev.lines_ptr() };
-        let (okb, spb, bad) = unsafe {
+        let ucap = if R12 { g.ucap.min(R12_UMAX) } else { g.ucap };
+        let p = EvP { ing_base: g.ing_base, ws: g.ws, wlen: g.wlen, ukey: g.ukey, ekey: g.ekey, ucap, ecap: g.ecap, ptab: self.tabs.prod.as_ptr(), sinkb: self.t.ev.sink_b() };
+        let (okb, spb, bad, pmb) = unsafe {
             if (TS_BAD.wrapping_sub(p.ing_base) as u64) >= ING_MAX * 1000 {
-                ev_vec::<false>(&*self.eb, &mut *self.out, n, &p)
+                ev_vec::<false>(&mut *self.eb, &mut *self.out, n, &p)
             } else {
-                ev_vec::<true>(&*self.eb, &mut *self.out, n, &p)
+                ev_vec::<true>(&mut *self.eb, &mut *self.out, n, &p)
             }
         };
         if bad {
@@ -555,7 +1076,34 @@ impl<'a> Ctx<'a> {
             self.t.prof[7] = self.t.prof[7].wrapping_add(okb ^ spb ^ self.out.rec[3][0] ^ self.out.rec[5][1] ^ self.out.ob[7]);
             return;
         }
-        unsafe { self.t.ev.push_many(okb, n, self.out.ob.as_ptr(), self.out.lp.as_ptr(), self.out.rec.as_ptr()) };
+        if R12 {
+            let mut m = pmb & okb;
+            let sink_b = self.t.ev.sink_b();
+            while m != 0 {
+                let i = m.trailing_zeros() as usize;
+                m &= m - 1;
+                unsafe {
+                    let pp = *self.eb.pp.get_unchecked(i);
+                    let prod = (pp as u32 as usize).min(PBOUND);
+                    let cat = *p.ptab.add(prod) as u64;
+                    let r = self.out.rec.get_unchecked_mut(i);
+                    let (q, x) = (r[0], r[1]);
+                    let w0 = x << 32 | (pp >> 23 & 0xFF_FFFF << 9) | cat << 4 | q >> 59;
+                    self.t.ev.esc_defer((x >> 32) as usize, w0, q & R12_M59);
+                    if R12_NULL {
+                        r[0] = r12_null(q & (BSIZE as u64 - 1));
+                        r[1] = u32::MAX as u64 | (x >> 32) << 32;
+                    } else {
+                        r[1] = x as u32 as u64 | sink_b << 32;
+                    }
+                }
+            }
+        }
+        let pm = if R12 { okb | spb } else { okb };
+        unsafe { self.t.ev.push_many(pm, n, self.out.ob.as_ptr(), self.out.rec.as_ptr()) };
+        if R12 {
+            self.t.ev.esc_flush();
+        }
         let mut m = spb;
         while m != 0 {
             let i = m.trailing_zeros() as usize;
@@ -632,8 +1180,8 @@ impl<'a> Ctx<'a> {
             }
             return;
         }
-        let p = CkP { cbase: g.cbase, clen: g.clen, ukey: g.ukey, ucap: g.ucap, ckey: g.ckey, ccap: g.ccap, ctab: self.tabs.camp.as_ptr(), crange: self.tabs.crange, lines: self.t.us.lines_ptr() };
-        let (okb, spb) = unsafe {
+        let p = CkP { cbase: g.cbase, clen: g.clen, ukey: g.ukey, ucap: g.ucap, ckey: g.ckey, ccap: g.ccap, ctab: self.tabs.camp.as_ptr(), crange: self.tabs.crange, sinkb: self.t.us.sink_b() };
+        let (_okb, spb) = unsafe {
             match (p.crange.is_some(), p.ccap != 0) {
                 (true, false) => ck_vec::<true, false>(&*self.cb, &mut *self.out, n, &p),
                 (false, false) => ck_vec::<false, false>(&*self.cb, &mut *self.out, n, &p),
@@ -641,7 +1189,7 @@ impl<'a> Ctx<'a> {
                 (false, true) => ck_vec::<false, true>(&*self.cb, &mut *self.out, n, &p),
             }
         };
-        unsafe { self.t.us.push_many(okb, n, self.out.ob.as_ptr(), self.out.lp.as_ptr(), self.out.rec.as_ptr()) };
+        unsafe { self.t.us.push_all(n, self.out.ob.as_ptr(), self.out.rec.as_ptr()) };
         let mut m = spb;
         while m != 0 {
             let i = m.trailing_zeros() as usize;
@@ -661,96 +1209,132 @@ struct EvP {
     ucap: u64,
     ecap: u64,
     ptab: *const u8,
-    lines: *const u8,
+    sinkb: u64,
 }
 
 #[inline(always)]
-unsafe fn ev_vec<const TSB: bool>(eb: &EvBatch, out: &mut Out, n: usize, p: &EvP) -> (u64, u64, bool) {
+unsafe fn ev_vec<const TSB: bool>(eb: &mut EvBatch, out: &mut Out, n: usize, p: &EvP) -> (u64, u64, bool, u64) {
     use std::arch::x86_64::*;
-    let mut mk = [[0u8; 8]; 3];
-    let s = |v: u64| _mm512_set1_epi64(v as i64);
+    const _: () = assert!(std::mem::offset_of!(EvBatch, _pad) == std::mem::offset_of!(EvBatch, ing) + 8 * NB);
+    if !TSB {
+        _mm256_storeu_si256(eb.ing.as_mut_ptr().add(n) as *mut __m256i, _mm256_set1_epi64x(p.ing_base));
+        _mm256_storeu_si256(eb.ing.as_mut_ptr().add(n + 4) as *mut __m256i, _mm256_set1_epi64x(p.ing_base));
+    }
+    let eb: &EvBatch = eb;
+    let mut mk = [[0u8; 16]; 3];
+    let s = |v: u64| _mm256_set1_epi64x(v as i64);
     let m40 = s(crate::keyrec::MASK);
     let binv = s(crate::keyrec::BINV);
     let ainv = s(crate::keyrec::AINV);
     let ukey = s(p.ukey & crate::keyrec::MASK);
     let ekey = s(p.ekey & crate::keyrec::MASK);
     let lim40 = s(1 << 40);
-    let unscr = |yb: __m512i, key: __m512i| {
-        let x = _mm512_and_si512(yb, m40);
-        let x = _mm512_xor_si512(x, _mm512_xor_si512(_mm512_srli_epi64::<17>(x), _mm512_srli_epi64::<34>(x)));
-        _mm512_and_si512(mul8(_mm512_xor_si512(x, key), ainv), m40)
+    let unscr = |yb: __m256i, key: __m256i| {
+        let x = _mm256_and_si256(yb, m40);
+        let x = _mm256_xor_si256(x, _mm256_xor_si256(_mm256_srli_epi64::<17>(x), _mm256_srli_epi64::<34>(x)));
+        _mm256_and_si256(mul4(_mm256_xor_si256(x, key), ainv), m40)
     };
+    const OB: usize = std::mem::offset_of!(Out, ob);
+    const RC: usize = std::mem::offset_of!(Out, rec);
+    let outp = out as *mut Out as *mut u8;
     let ing_base = s(p.ing_base as u64);
-    let ing_lim = s(ING_MAX * 1000);
+    let ing_lim = hide(s(ING_MAX * 1000));
     let ts_bad = s(TS_BAD as u64);
     let ws = s(p.ws as u64);
     let wlen = s(p.wlen);
     let empty = s(ID_EMPTY);
-    let zero = _mm512_setzero_si512();
-    let p24 = s(0xFF_FFFF);
-    let day = s(DAY_MS as u64);
+    let p24s9 = s(0xFF_FFFF << 9);
+    let p24s32 = hide(s(0xFF_FFFF << 32));
+    let day = hide(s(DAY_MS as u64));
     let ucap = s(p.ucap);
-    let nal = s(NALIAS);
+    let nal = hide(s(NALIAS));
     let ecap = s(p.ecap);
     let m511 = s(511);
     let slotm = s(BSIZE as u64 - 1);
     let magic = s(274_877_907);
     let ones = s(u64::MAX);
-    let lines = s(p.lines as u64);
-    let ix_lo = _mm512_setr_epi64(0, 8, 1, 9, 2, 10, 3, 11);
-    let ix_hi = _mm512_setr_epi64(4, 12, 5, 13, 6, 14, 7, 15);
+    let sinkhi = s(p.sinkb << 32);
+    let himask = s(0xFFFF_FFFF_0000_0000);
+    let mut ingmax = _mm256_setzero_si256();
+    let ix_lo = if R12 { _mm256_setr_epi64x(0, 4, 1, 5) } else { _mm256_setr_epi64x(0, 4, 1, 5) };
+    let ix_hi = if R12 { _mm256_setr_epi64x(2, 6, 3, 7) } else { _mm256_setr_epi64x(2, 6, 3, 7) };
     let mut j = 0;
     let mut g = 0;
-    while j < n {
-        let ingr = _mm512_load_si512(eb.ing.as_ptr().add(j) as *const __m512i);
-        let ing = _mm512_sub_epi64(ingr, ing_base);
-        let bad = if TSB { kor(_mm512_cmpeq_epi64_mask(ingr, ts_bad), _mm512_cmpge_epu64_mask(ing, ing_lim)) } else { _mm512_cmpge_epu64_mask(ing, ing_lim) };
-        let ing_s = _mm512_srli_epi64::<38>(_mm512_mul_epu32(ing, magic));
-        let ts = _mm512_load_si512(eb.ts.as_ptr().add(j) as *const __m512i);
-        let rel = _mm512_sub_epi64(ts, ws);
-        let eid = _mm512_load_si512(eb.eid.as_ptr().add(j) as *const __m512i);
-        let uid = _mm512_load_si512(eb.uid.as_ptr().add(j) as *const __m512i);
-        let pp = _mm512_load_si512(eb.pp.as_ptr().add(j) as *const __m512i);
-        let price = _mm512_and_si512(_mm512_srli_epi64::<32>(pp), p24);
-        let valid = _mm512_cmpneq_epi64_mask(uid, empty);
-        let valid = _mm512_mask_cmplt_epu64_mask(valid, rel, wlen);
-        let valid = _mm512_mask_cmpgt_epi64_mask(valid, pp, ones);
-        let valid = _mm512_mask_cmple_epi64_mask(valid, _mm512_sub_epi64(ingr, ts), day);
-        let w = unscr(mul8(uid, binv), ukey);
-        let user = _mm512_srli_epi64::<9>(w);
-        let alias = _mm512_and_si512(w, m511);
-        let normal = _mm512_mask_cmplt_epu64_mask(_mm512_mask_cmplt_epu64_mask(_mm512_cmplt_epu64_mask(uid, lim40), user, ucap), alias, nal);
-        let pm = _mm512_mask_cmpneq_epi64_mask(valid, price, zero);
-        let w0v = _mm512_or_si512(_mm512_or_si512(_mm512_slli_epi64::<33>(rel), _mm512_slli_epi64::<9>(price)), alias);
-        let w0v = _mm512_mask_blend_epi64(valid, ones, w0v);
-        let userv = _mm512_maskz_mov_epi64(valid, user);
-        let v = unscr(mul8(eid, binv), ekey);
-        let evok = _mm512_mask_cmplt_epu64_mask(_mm512_cmplt_epu64_mask(eid, lim40), v, ecap);
-        let w1v = _mm512_or_si512(_mm512_and_si512(v, slotm), _mm512_or_si512(_mm512_slli_epi64::<16>(ing_s), _mm512_slli_epi64::<37>(userv)));
+    macro_rules! grp {
+        () => {{
+        let ingr = _mm256_load_si256(eb.ing.as_ptr().add(j) as *const __m256i);
+        let ing = _mm256_sub_epi64(ingr, ing_base);
+        let bad = if TSB { kor(_mm256_cmpeq_epi64_mask(ingr, ts_bad), _mm256_cmpge_epu64_mask(ing, ing_lim)) } else { 0 };
+        if !TSB {
+            ingmax = _mm256_max_epu64(ingmax, ing);
+        }
+        let ing_s = _mm256_srli_epi64::<38>(_mm256_mul_epu32(ing, magic));
+        let ts = _mm256_load_si256(eb.ts.as_ptr().add(j) as *const __m256i);
+        let rel = _mm256_sub_epi64(ts, ws);
+        let eid = _mm256_load_si256(eb.eid.as_ptr().add(j) as *const __m256i);
+        let uid = _mm256_load_si256(eb.uid.as_ptr().add(j) as *const __m256i);
+        let pp = _mm256_load_si256(eb.pp.as_ptr().add(j) as *const __m256i);
+        let price9 = _mm256_and_si256(_mm256_srli_epi64::<23>(pp), p24s9);
+        let valid = _mm256_cmpneq_epi64_mask(uid, empty);
+        let valid = mcmp::<false, 1>(valid, rel, wlen);
+        let valid = mcmp::<true, 6>(valid, pp, ones);
+        let valid = mcmp::<true, 2>(valid, _mm256_sub_epi64(ingr, ts), day);
+        let w = unscr(mul4(uid, binv), ukey);
+        let user = _mm256_srli_epi64::<9>(w);
+        let alias = _mm256_and_si256(w, m511);
+        let normal = _mm256_mask_cmplt_epu64_mask(_mm256_mask_cmplt_epu64_mask(_mm256_cmplt_epu64_mask(uid, lim40), user, ucap), alias, nal);
+        let pm = _mm256_mask_test_epi64_mask(valid, pp, p24s32);
+        let w0v = _mm256_ternarylogic_epi64::<0xFE>(_mm256_slli_epi64::<33>(rel), price9, alias);
+        let w0v = blendm(valid, ones, w0v);
+        let userv = _mm256_maskz_mov_epi64(valid, user);
+        let v = unscr(mul4(eid, binv), ekey);
+        let evok = _mm256_mask_cmplt_epu64_mask(_mm256_cmplt_epu64_mask(eid, lim40), v, ecap);
+        let w1v = if R12 {
+            let t = _mm256_or_si256(_mm256_and_si256(v, slotm), _mm256_slli_epi64::<16>(ing_s));
+            _mm256_mask_ternarylogic_epi64::<0xFE>(t, valid, _mm256_slli_epi64::<37>(user), _mm256_slli_epi64::<59>(alias))
+        } else {
+            _mm256_or_si256(_mm256_and_si256(v, slotm), _mm256_or_si256(_mm256_slli_epi64::<16>(ing_s), _mm256_slli_epi64::<37>(userv)))
+        };
         let ok = kandn(kandn(normal, valid), evok);
-        let bv = _mm512_srli_epi64::<{ BB as u32 }>(v);
-        _mm512_store_si512(out.rec.as_mut_ptr().add(j).cast(), _mm512_permutex2var_epi64(w0v, ix_lo, w1v));
-        _mm512_store_si512(out.rec.as_mut_ptr().add(j + 4).cast(), _mm512_permutex2var_epi64(w0v, ix_hi, w1v));
-        _mm512_store_si512(out.ob.as_mut_ptr().add(j).cast(), bv);
-        _mm512_store_si512(out.lp.as_mut_ptr().add(j).cast(), _mm512_add_epi64(_mm512_slli_epi64::<6>(bv), lines));
-        kst(mk[0].as_mut_ptr(), g, bad);
+        if R12 {
+            let h = blendm(valid, ones, _mm256_slli_epi64::<1>(rel));
+            let bh = blendm(ok, sinkhi, _mm256_slli_epi64::<{ 32 - BB as i32 }>(v));
+            let xv = _mm256_ternarylogic_epi64::<0xCA>(himask, bh, h);
+            st4::<RC>(outp, 2 * j, _mm256_permutex2var_epi64(w1v, ix_lo, xv));
+            st4::<{ RC + 32 }>(outp, 2 * j, _mm256_permutex2var_epi64(w1v, ix_hi, xv));
+        } else {
+            st4::<RC>(outp, 2 * j, _mm256_permutex2var_epi64(w0v, ix_lo, w1v));
+            st4::<{ RC + 32 }>(outp, 2 * j, _mm256_permutex2var_epi64(w0v, ix_hi, w1v));
+            st4::<OB>(outp, j, _mm256_srli_epi64::<{ BB as i32 }>(v));
+        }
+        if TSB {
+            kst(mk[0].as_mut_ptr(), g, bad);
+        }
         kst(mk[1].as_mut_ptr(), g, pm);
         kst(mk[2].as_mut_ptr(), g, ok);
-        j += 8;
+        }};
+    }
+    while j < n {
+        grp!();
+        j += 4;
         g += 1;
     }
     let nm = if n >= 64 { !0 } else { (1u64 << n) - 1 };
-    let badb = u64::from_le_bytes(mk[0]);
-    let okb = u64::from_le_bytes(mk[2]) & nm;
+    let badb = if TSB { mask64(&mk[0]) & nm != 0 } else { _mm256_cmpge_epu64_mask(ingmax, ing_lim) != 0 };
+    let okb = mask64(&mk[2]) & nm;
     let spb = !okb & nm;
-    let mut pmb = u64::from_le_bytes(mk[1]) & nm;
+    let pm = mask64(&mk[1]) & nm;
+    if R12 {
+        return (okb, spb, badb, pm);
+    }
+    let mut pmb = pm;
     while pmb != 0 {
         let i = pmb.trailing_zeros() as usize;
         pmb &= pmb - 1;
         let prod = (*eb.pp.get_unchecked(i) as u32 as usize).min(PBOUND);
         out.rec.get_unchecked_mut(i)[0] |= (*p.ptab.add(prod) as u64) << 4;
     }
-    (okb, spb, badb & nm != 0)
+    (okb, spb, badb, 0)
 }
 
 struct CkP {
@@ -762,14 +1346,14 @@ struct CkP {
     ccap: u64,
     ctab: *const u8,
     crange: Option<(u64, u64)>,
-    lines: *const u8,
+    sinkb: u64,
 }
 
 #[inline(always)]
 unsafe fn ck_vec<const RANGED: bool, const MODE_A: bool>(cb: &CkBatch, out: &mut Out, n: usize, p: &CkP) -> (u64, u64) {
     use std::arch::x86_64::*;
-    let mut mk = [[0u8; 8]; 2];
-    let s = |v: u64| _mm512_set1_epi64(v as i64);
+    let mut mk = [[0u8; 16]; 2];
+    let s = |v: u64| _mm256_set1_epi64x(v as i64);
     let m40 = s(crate::keyrec::MASK);
     let binv = s(crate::keyrec::BINV);
     let ainv = s(crate::keyrec::AINV);
@@ -784,57 +1368,64 @@ unsafe fn ck_vec<const RANGED: bool, const MODE_A: bool>(cb: &CkBatch, out: &mut
     let nal = s(NALIAS);
     let m511 = s(511);
     let ulo = s(UBSIZE as u64 - 1);
-    let lines = s(p.lines as u64);
+    let mut sinkv = _mm256_add_epi64(s(p.sinkb), _mm256_setr_epi64x(0, 1, 2, 3));
+    let four = s(4);
     let (clo, cspan) = (s(p.crange.unwrap_or((0, 0)).0), s(p.crange.unwrap_or((0, 0)).1));
-    let ix_lo = _mm512_setr_epi64(0, 8, 1, 9, 2, 10, 3, 11);
-    let ix_hi = _mm512_setr_epi64(4, 12, 5, 13, 6, 14, 7, 15);
+    const OB: usize = std::mem::offset_of!(Out, ob);
+    const LP: usize = std::mem::offset_of!(Out, lp);
+    const RC: usize = std::mem::offset_of!(Out, rec);
+    let outp = out as *mut Out as *mut u8;
+    let ix_lo = _mm256_setr_epi64x(0, 4, 1, 5);
+    let ix_hi = _mm256_setr_epi64x(2, 6, 3, 7);
     let mut j = 0;
     let mut g = 0;
     while j < n {
-        let ts = _mm512_load_si512(cb.ts.as_ptr().add(j) as *const __m512i);
-        let rel = _mm512_sub_epi64(ts, cbase);
-        let cid = _mm512_load_si512(cb.cid.as_ptr().add(j) as *const __m512i);
-        let uid = _mm512_load_si512(cb.uid.as_ptr().add(j) as *const __m512i);
-        let camp = _mm512_load_si512(cb.camp.as_ptr().add(j) as *const __m512i);
+        let ts = _mm256_load_si256(cb.ts.as_ptr().add(j) as *const __m256i);
+        let rel = _mm256_sub_epi64(ts, cbase);
+        let cid = _mm256_load_si256(cb.cid.as_ptr().add(j) as *const __m256i);
+        let uid = _mm256_load_si256(cb.uid.as_ptr().add(j) as *const __m256i);
+        let camp = _mm256_load_si256(cb.camp.as_ptr().add(j) as *const __m256i);
         let incsv = if RANGED {
-            _mm512_cmple_epu64_mask(_mm512_sub_epi64(camp, clo), cspan)
+            _mm256_cmple_epu64_mask(_mm256_sub_epi64(camp, clo), cspan)
         } else {
-            let inb = _mm512_cmplt_epu64_mask(camp, cbound);
-            let ch = _mm512_and_si512(_mm512_mask_i64gather_epi64::<1>(mff, inb, camp, p.ctab as *const i64), mff);
-            _mm512_mask_cmpneq_epi64_mask(inb, ch, mff)
+            let inb = _mm256_cmplt_epu64_mask(camp, cbound);
+            let ch = _mm256_and_si256(_mm256_mmask_i64gather_epi64::<1>(mff, inb, camp, p.ctab as *const i64), mff);
+            _mm256_mask_cmpneq_epi64_mask(inb, ch, mff)
         };
-        let keep = _mm512_mask_cmplt_epu64_mask(_mm512_mask_cmpneq_epi64_mask(incsv, uid, empty), rel, clen);
-        let x = _mm512_and_si512(mul8(uid, binv), m40);
-        let x = _mm512_xor_si512(x, _mm512_xor_si512(_mm512_srli_epi64::<17>(x), _mm512_srli_epi64::<34>(x)));
-        let w = _mm512_and_si512(mul8(_mm512_xor_si512(x, ukey), ainv), m40);
-        let u = _mm512_srli_epi64::<9>(w);
-        let alias = _mm512_and_si512(w, m511);
-        let ok = _mm512_mask_cmplt_epu64_mask(keep, uid, lim40);
-        let ok = _mm512_mask_cmplt_epu64_mask(ok, u, ucap);
-        let ok = _mm512_mask_cmplt_epu64_mask(ok, alias, nal);
-        let mut ok = _mm512_mask_cmplt_epu64_mask(ok, cid, lim40);
+        let keep = _mm256_mask_cmplt_epu64_mask(_mm256_mask_cmpneq_epi64_mask(incsv, uid, empty), rel, clen);
+        let x = _mm256_and_si256(mul4(uid, binv), m40);
+        let x = _mm256_xor_si256(x, _mm256_xor_si256(_mm256_srli_epi64::<17>(x), _mm256_srli_epi64::<34>(x)));
+        let w = _mm256_and_si256(mul4(_mm256_xor_si256(x, ukey), ainv), m40);
+        let u = _mm256_srli_epi64::<9>(w);
+        let alias = _mm256_and_si256(w, m511);
+        let ok = _mm256_cmplt_epu64_mask(uid, lim40);
+        let ok = _mm256_mask_cmplt_epu64_mask(ok, u, ucap);
+        let ok = _mm256_mask_cmplt_epu64_mask(ok, alias, nal);
+        let ok = _mm256_mask_cmplt_epu64_mask(ok, cid, lim40);
+        let mut ok = kand(ok, keep);
         let mut idw = cid;
         if MODE_A {
-            let y = _mm512_and_si512(mul8(cid, binv), m40);
-            let y = _mm512_xor_si512(y, _mm512_xor_si512(_mm512_srli_epi64::<17>(y), _mm512_srli_epi64::<34>(y)));
-            idw = _mm512_and_si512(mul8(_mm512_xor_si512(y, s(p.ckey & crate::keyrec::MASK)), ainv), m40);
-            ok = _mm512_mask_cmplt_epu64_mask(ok, idw, s(p.ccap));
+            let y = _mm256_and_si256(mul4(cid, binv), m40);
+            let y = _mm256_xor_si256(y, _mm256_xor_si256(_mm256_srli_epi64::<17>(y), _mm256_srli_epi64::<34>(y)));
+            idw = _mm256_and_si256(mul4(_mm256_xor_si256(y, s(p.ckey & crate::keyrec::MASK)), ainv), m40);
+            ok = _mm256_mask_cmplt_epu64_mask(ok, idw, s(p.ccap));
         }
-        let key = _mm512_or_si512(_mm512_slli_epi64::<32>(rel), _mm512_slli_epi64::<4>(camp));
-        let o0 = _mm512_or_si512(idw, _mm512_slli_epi64::<43>(_mm512_and_si512(u, ulo)));
-        let o1 = _mm512_or_si512(key, alias);
-        let bv = _mm512_srli_epi64::<{ UB as u32 }>(u);
-        _mm512_store_si512(out.rec.as_mut_ptr().add(j).cast(), _mm512_permutex2var_epi64(o0, ix_lo, o1));
-        _mm512_store_si512(out.rec.as_mut_ptr().add(j + 4).cast(), _mm512_permutex2var_epi64(o0, ix_hi, o1));
-        _mm512_store_si512(out.ob.as_mut_ptr().add(j).cast(), bv);
-        _mm512_store_si512(out.lp.as_mut_ptr().add(j).cast(), _mm512_add_epi64(_mm512_slli_epi64::<6>(bv), lines));
+        let key = _mm256_or_si256(_mm256_slli_epi64::<32>(rel), _mm256_slli_epi64::<4>(camp));
+        let o0 = _mm256_or_si256(idw, _mm256_slli_epi64::<43>(_mm256_and_si256(u, ulo)));
+        let o1 = _mm256_or_si256(key, alias);
+        let bv = _mm256_srli_epi64::<{ UB as i32 }>(u);
+        let bv = _mm256_mask_mov_epi64(sinkv, ok, bv);
+        sinkv = _mm256_add_epi64(sinkv, four);
+        st4::<RC>(outp, 2 * j, _mm256_permutex2var_epi64(o0, ix_lo, o1));
+        st4::<{ RC + 32 }>(outp, 2 * j, _mm256_permutex2var_epi64(o0, ix_hi, o1));
+        st4::<OB>(outp, j, bv);
         kst(mk[0].as_mut_ptr(), g, ok);
         kst(mk[1].as_mut_ptr(), g, keep);
-        j += 8;
+        j += 4;
         g += 1;
     }
     let nm = if n >= 64 { !0 } else { (1u64 << n) - 1 };
-    let (okb, kpb) = (u64::from_le_bytes(mk[0]), u64::from_le_bytes(mk[1]));
+    let (okb, kpb) = (mask64(&mk[0]), mask64(&mk[1]));
     (okb & nm, kpb & !okb & nm)
 }
 
@@ -1138,7 +1729,6 @@ fn lk_batch(c: &mut Ctx, buf: &[u8], lb: &mut LkBatch, n: usize) {
         let nal = s(NALIAS);
         let m511 = s(511);
         let ulo = s(UBSIZE as u64 - 1);
-        let lines = s(c.t.us.lines_ptr() as u64);
         let link = s(1 << 63);
         let zero = _mm256_setzero_si256();
         let ix_lo = _mm256_setr_epi64x(0, 4, 1, 5);
@@ -1173,7 +1763,6 @@ fn lk_batch(c: &mut Ctx, buf: &[u8], lb: &mut LkBatch, n: usize) {
             st4::<RC>(outp, 2 * j, _mm256_permutex2var_epi64(o0, ix_lo, zero));
             st4::<{ RC + 32 }>(outp, 2 * j, _mm256_permutex2var_epi64(o0, ix_hi, zero));
             st4::<OB>(outp, j, bv);
-            st4::<LP>(outp, j, _mm256_add_epi64(_mm256_slli_epi64::<6>(bv), lines));
             kst(mk[0].as_mut_ptr(), j / 4, ok);
             kst(mk[1].as_mut_ptr(), j / 4, kandn(ok, ne));
             kst(mk[2].as_mut_ptr(), j / 4, dok);
@@ -1182,7 +1771,7 @@ fn lk_batch(c: &mut Ctx, buf: &[u8], lb: &mut LkBatch, n: usize) {
     }
     let nm = if n >= 64 { !0 } else { (1u64 << n) - 1 };
     let (okb, mut genb, decb) = unsafe { (mask64(&mk[0]) & nm, mask64(&mk[1]) & nm, mask64(&mk[2]) & nm) };
-    unsafe { c.t.us.push_many(okb, n, out.ob.as_ptr(), out.lp.as_ptr(), out.rec.as_ptr()) };
+    unsafe { c.t.us.push_many(okb, n, out.ob.as_ptr(), out.rec.as_ptr()) };
     c.t.n_lk_rows += decb.count_ones() as u64;
     let mut slow = !decb & nm;
     while slow != 0 {
@@ -1483,10 +2072,10 @@ mod tests {
                 wlen,
                 ukey: r.next(),
                 ekey: r.next(),
-                ucap: 1 + r.below(1 << 26),
+                ucap: if R12 { (1 + r.below(1 << 26)).min(R12_UMAX) } else { 1 + r.below(1 << 26) },
                 ecap: 1 + r.below(1 << 28),
                 ptab: prod.as_ptr(),
-                lines: (r.below(1 << 40) << 6) as *const u8,
+                sinkb: r.below(1 << 12),
             };
             let n = 1 + r.below(64) as usize;
             let mut rows = Vec::new();
@@ -1550,11 +2139,15 @@ mod tests {
                 eb.uid[i] = r.next();
                 eb.pp[i] = r.next();
             }
-            let (okb, spb, bad) = unsafe { ev_vec::<true>(&eb, &mut out, n, &p) };
+            let (okb, spb, bad, pmb) = unsafe { ev_vec::<true>(&mut eb, &mut out, n, &p) };
             if (TS_BAD.wrapping_sub(p.ing_base) as u64) >= ING_MAX * 1000 {
                 let rec = out.rec;
-                assert_eq!(unsafe { ev_vec::<false>(&eb, &mut out, n, &p) }, (okb, spb, bad));
+                let ob = out.ob;
+                assert_eq!(unsafe { ev_vec::<false>(&mut eb, &mut out, n, &p) }, (okb, spb, bad, pmb));
                 assert_eq!(&rec[..n], &out.rec[..n]);
+                if !R12 {
+                    assert_eq!(&ob[..n], &out.ob[..n]);
+                }
             }
             assert_eq!(okb & spb, 0);
             assert_eq!((okb | spb).count_ones() as usize, n, "round {round}");
@@ -1603,11 +2196,42 @@ mod tests {
                 special |= pushed.is_none();
                 if special {
                     assert!(spb >> i & 1 == 1, "round {round} row {i}: {row:?}");
+                    if R12 {
+                        assert_eq!(out.rec[i][1] >> 32, p.sinkb, "round {round} row {i}");
+                    }
                     n_sp += 1;
                 } else {
                     assert!(okb >> i & 1 == 1, "round {round} row {i}: {row:?}");
-                    assert_eq!(Some((out.ob[i], out.rec[i][0], out.rec[i][1])), pushed, "round {round} row {i}: {row:?}");
-                    assert_eq!(out.lp[i], p.lines as u64 + 64 * out.ob[i]);
+                    if R12 {
+                        let (q, x) = (out.rec[i][0], out.rec[i][1]);
+                        let pm = valid && row.price != 0;
+                        assert_eq!(pmb >> i & 1 == 1, pm, "round {round} row {i}");
+                        let cat = if pm { prod[(row.product as usize).min(PBOUND)] as u64 } else { 0 };
+                        let w0r = if pm {
+                            x << 32 | (eb.pp[i] >> 23 & 0xFF_FFFF << 9) | cat << 4 | q >> 59
+                        } else if x as u32 == u32::MAX {
+                            u64::MAX
+                        } else {
+                            x << 32 | q >> 59
+                        };
+                        assert_eq!(Some((x >> 32, w0r, q & R12_M59)), pushed, "round {round} row {i}: {row:?}");
+                        assert_eq!(q >> 59, if valid { w0 & 15 } else { 0 });
+                        assert_eq!(q >> 37 & (R12_M59 >> 37), user);
+                        if !pm {
+                            let mut e = [0u8; 16];
+                            e[..8].copy_from_slice(&q.to_le_bytes());
+                            e[8..].copy_from_slice(&x.to_le_bytes());
+                            let d = unsafe { dec12(e.as_ptr()) };
+                            assert_eq!(d.w1, q & R12_M59);
+                            if valid {
+                                assert_eq!(d.w0, w0);
+                            } else {
+                                assert_eq!(d.w0 >> 33, INVALID_TS);
+                            }
+                        }
+                    } else {
+                        assert_eq!(Some((out.ob[i], out.rec[i][0], out.rec[i][1])), pushed, "round {round} row {i}: {row:?}");
+                    }
                     n_ok += 1;
                 }
             }
@@ -1642,7 +2266,7 @@ mod tests {
             let we = ws + ((1 + r.below(24)) * DAY_MS as u64) as i64;
             let t = round % 3;
             let camp = &tabs[t];
-            let p = CkP { cbase: ws - 7 * DAY_MS, clen: (we - ws + 7 * DAY_MS) as u64, ukey: r.next(), ucap: 1 + r.below(1 << 26), ckey: 0, ccap: 0, ctab: camp.as_ptr(), crange: camp_range(&camp[..CBOUND]), lines: (r.below(1 << 40) << 6) as *const u8 };
+            let p = CkP { cbase: ws - 7 * DAY_MS, clen: (we - ws + 7 * DAY_MS) as u64, ukey: r.next(), ucap: 1 + r.below(1 << 26), ckey: 0, ccap: 0, ctab: camp.as_ptr(), crange: camp_range(&camp[..CBOUND]), sinkb: r.below(1 << 12) };
             let n = 1 + r.below(64) as usize;
             let mut rows = Vec::new();
             for _ in 0..n {
@@ -1705,6 +2329,7 @@ mod tests {
                 let keep = !(row.uid == ID_EMPTY || rel >= p.clen || row.campaign as usize >= CBOUND) && camp[row.campaign as usize] != 255;
                 if !keep {
                     assert!((okb | spb) >> i & 1 == 0, "round {round} row {i}");
+                    assert_eq!(out.ob[i], p.sinkb + i as u64, "round {round} row {i}");
                     n_drop += 1;
                     continue;
                 }
@@ -1721,11 +2346,11 @@ mod tests {
                     Some(x) => {
                         assert!(okb >> i & 1 == 1, "round {round} row {i}");
                         assert_eq!((out.ob[i], out.rec[i][0], out.rec[i][1]), x);
-                        assert_eq!(out.lp[i], p.lines as u64 + 64 * out.ob[i]);
                         n_ok += 1;
                     }
                     None => {
                         assert!(spb >> i & 1 == 1, "round {round} row {i}");
+                        assert_eq!(out.ob[i], p.sinkb + i as u64, "round {round} row {i}");
                         n_sp += 1;
                     }
                 }
@@ -1742,6 +2367,9 @@ mod tests {
             let a2 = Arena::new(64 << 20);
             let mut p1 = Part::new(&a1, nb);
             let mut p2 = Part::new(&a2, nb);
+            let a3 = Arena::new(64 << 20);
+            let mut p3 = Part::new(&a3, nb);
+            let mut out3 = Out::new();
             let mut out = Out::new();
             for _ in 0..3000 {
                 let (m, n) = if r.below(3) == 0 {
@@ -1752,7 +2380,6 @@ mod tests {
                 };
                 for i in 0..64 {
                     out.ob[i] = r.below(nb as u64);
-                    out.lp[i] = p2.lines_ptr() as u64 + 64 * out.ob[i];
                     out.rec[i] = [r.next(), r.next()];
                 }
                 let mut mm = m;
@@ -1761,22 +2388,101 @@ mod tests {
                     mm &= mm - 1;
                     p1.push(out.ob[i] as usize, out.rec[i][0], out.rec[i][1]);
                 }
-                unsafe { p2.push_many(m, n, out.ob.as_ptr(), out.lp.as_ptr(), out.rec.as_ptr()) };
+                unsafe { p2.push_many(m, n, out.ob.as_ptr(), out.rec.as_ptr()) };
+                for i in 0..64 {
+                    let sink = m >> i & 1 == 0;
+                    out3.ob[i] = if sink { p3.sink_b() + i as u64 } else { out.ob[i] };
+                    out3.rec[i] = if sink { [r.next(), r.next()] } else { out.rec[i] };
+                }
+                unsafe { p3.push_all(n, out3.ob.as_ptr(), out3.rec.as_ptr()) };
                 let b = r.below(nb as u64) as usize;
                 let (x, y) = (r.next(), r.next());
                 p1.push(b, x, y);
                 p2.push(b, x, y);
+                p3.push(b, x, y);
             }
             p1.finish();
             p2.finish();
+            p3.finish();
             for b in 0..nb {
                 assert_eq!(p1.count(b), p2.count(b));
+                assert_eq!(p1.count(b), p3.count(b));
                 let mut v1 = Vec::new();
                 let mut v2 = Vec::new();
+                let mut v3 = Vec::new();
                 p1.for_each(b, |c| v1.extend(c.iter().map(|x| (x.w0, x.w1))));
                 p2.for_each(b, |c| v2.extend(c.iter().map(|x| (x.w0, x.w1))));
+                p3.for_each(b, |c| v3.extend(c.iter().map(|x| (x.w0, x.w1))));
                 assert_eq!(v1, v2, "nb {nb} b {b}");
+                assert_eq!(v1, v3, "nb {nb} b {b} (push_all)");
                 assert_eq!(v1.len(), p1.count(b));
+            }
+        }
+    }
+
+    #[test]
+    fn evpart_matches_list() {
+        let mut r = Rng(0x1234_5678_9ABC_DEF0);
+        for &nb in &[1usize, 2, 5, 37, 3000] {
+            let a2 = Arena::new(64 << 20);
+            let mut p2 = EvPart::new(&a2, nb);
+            let mut main: Vec<Vec<[u64; 2]>> = vec![Vec::new(); nb];
+            let mut esc: Vec<Vec<[u64; 2]>> = vec![Vec::new(); nb];
+            let mut out = Out::new();
+            let cut = |x: [u64; 2]| if R12 { [x[0], x[1] & 0xFFFF_FFFF] } else { x };
+            for round in 0..3000 {
+                let (m, n) = if r.below(3) == 0 {
+                    (r.next(), 64)
+                } else {
+                    let sh = r.below(64);
+                    (u64::MAX >> sh, 64 - sh as usize)
+                };
+                for i in 0..64 {
+                    out.ob[i] = r.below(nb as u64);
+                    out.rec[i] = [r.next(), r.next()];
+                    if R12 {
+                        if r.below(6) == 0 {
+                            out.ob[i] = p2.sink_b();
+                        }
+                        out.rec[i][1] = out.rec[i][1] & 0xFFFF_FFFF | out.ob[i] << 32;
+                    }
+                }
+                let mut mm = m & if n >= 64 { !0 } else { (1u64 << n) - 1 };
+                while mm != 0 {
+                    let i = mm.trailing_zeros() as usize;
+                    mm &= mm - 1;
+                    if (out.ob[i] as usize) < nb {
+                        main[out.ob[i] as usize].push(cut(out.rec[i]));
+                    }
+                }
+                unsafe { p2.push_many(m, n, out.ob.as_ptr(), out.rec.as_ptr()) };
+                for _ in 0..(round % 3) {
+                    let b = r.below(nb as u64) as usize;
+                    let (x, y) = (r.next(), r.next());
+                    if R12 {
+                        esc[b].push([x, y]);
+                    } else {
+                        main[b].push([x, y]);
+                    }
+                    p2.push(b, x, y);
+                }
+            }
+            p2.finish();
+            for b in 0..nb {
+                assert_eq!(p2.count(b), main[b].len());
+                let mut v = Vec::new();
+                p2.for_each_raw(b, |p, n| {
+                    for i in 0..n {
+                        let e = unsafe { p.add(EV_REC * i) };
+                        let q = unsafe { (e as *const u64).read_unaligned() };
+                        let h = if R12 { unsafe { (e.add(8) as *const u32).read_unaligned() as u64 } } else { unsafe { (e.add(8) as *const u64).read_unaligned() } };
+                        v.push([q, h]);
+                    }
+                });
+                assert_eq!(v, main[b], "nb {nb} b {b}");
+                let mut w = Vec::new();
+                p2.for_each_esc(b, |c| w.extend(c.iter().map(|x| [x.w0, x.w1])));
+                assert_eq!(w, esc[b], "nb {nb} b {b}");
             }
         }
     }
@@ -2062,6 +2768,8 @@ unsafe fn chunk_rd(g: &G, t: &mut TState, eb: &mut EvBatch, cb: &mut CkBatch, ou
 }
 
 pub fn stage1(g: &G, tid: usize) {
+    #[cfg(feature = "sp")]
+    let sp0 = crate::sys::sp::ru(1);
     #[cfg(feature = "pmu")]
     let pm = pmu::start();
     #[cfg(feature = "tl")]
@@ -2081,11 +2789,14 @@ pub fn stage1(g: &G, tid: usize) {
     #[cfg(feature = "tl")]
     crate::sys::tl::mark(tid, 6);
     let t = g.t(tid);
+    if R12 && g.wlen >= 1 << 31 {
+        fallback("window too long for 12-byte event records");
+    }
     if PARTS_READY.load(Ordering::Relaxed) {
         t.ev.set_arena(&g.ev_arena);
         t.us.set_arena(&g.us_arena);
     } else {
-        t.ev = Part::new(&g.ev_arena, g.nb);
+        t.ev = EvPart::new(&g.ev_arena, g.nb);
         t.us = Part::new(&g.us_arena, g.nub);
     }
     #[cfg(feature = "tl")]
@@ -2127,7 +2838,7 @@ pub fn stage1(g: &G, tid: usize) {
                 unsafe { crate::ckix::flush(&mut out.pd, g.csr) };
             }
             crate::links::us_finished(g, out.pd.end, inq);
-            if inq {
+            if inq && !HOLD_FREE.load(Ordering::Relaxed) {
                 while crate::links::job(g, &mut *t, &mut sc) {}
             }
         }
@@ -2148,12 +2859,18 @@ pub fn stage1(g: &G, tid: usize) {
         let f = &g.files[c.file as usize];
         if use_rd && fds[c.file as usize] >= 0 {
             unsafe { chunk_rd(g, &mut *t, &mut eb, &mut cb, &mut out, tb, tid, f, &c, fds[c.file as usize], rb, rd) };
+            if unsafe { RELEASE } && fr_k() > 1 {
+                fr_done(g, q, i, fr_k());
+            }
             continue;
         }
         let data = unsafe { std::slice::from_raw_parts(g.region.add(f.off), f.len) };
         let s = if c.a == f.hdr { c.a } else { next_line_start(data, c.a - 1) };
         let e = if c.b >= f.len { f.len } else { next_line_start(data, c.b - 1) };
         if s >= e {
+            if unsafe { RELEASE } && fr_k() > 1 {
+                fr_done(g, q, i, fr_k());
+            }
             continue;
         }
         let buf = &data[s..e];
@@ -2166,13 +2883,22 @@ pub fn stage1(g: &G, tid: usize) {
             }
             t.prof[7] = t.prof[7].wrapping_add(x);
         } else {
+            #[cfg(feature = "sp")]
+            if SPTOUCH.load(Ordering::Relaxed) {
+                crate::sys::sp::input_touch(buf.as_ptr(), buf.len());
+            }
             parse_buf(g, &mut *t, &mut eb, &mut cb, &mut out, tb, tid, f, buf, s);
         }
         if unsafe { RELEASE } {
-            let a = (f.off + s + 4095) & !4095;
-            let b = (f.off + e) & !4095;
-            if b > a {
-                unsafe { madvise(g.region.add(a) as *mut u8, b - a, MADV_DONTNEED) };
+            let k = fr_k();
+            if k > 1 {
+                fr_done(g, q, i, k);
+            } else {
+                let a = (f.off + s + 4095) & !4095;
+                let b = (f.off + e) & !4095;
+                if b > a {
+                    unsafe { madvise(g.region.add(a) as *mut u8, b - a, MADV_DONTNEED) };
+                }
             }
         }
     }
@@ -2200,6 +2926,8 @@ pub fn stage1(g: &G, tid: usize) {
     }
     #[cfg(feature = "pmu")]
     pmu::stop(pm, g.nt);
+    #[cfg(feature = "sp")]
+    crate::sys::sp::thread_add(tid, sp0, crate::sys::sp::ru(1));
 }
 
 #[cfg(feature = "pmu")]
@@ -2258,3 +2986,73 @@ pub mod pmu {
         }
     }
 }
+
+
+const FR_K_DEF: usize = env_u32(option_env!("XL_RELK_DEF"), 8) as usize;
+static FR_K: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+#[inline]
+fn fr_k() -> usize {
+    *FR_K.get_or_init(|| std::env::var("XL_RELK").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(FR_K_DEF).max(1))
+}
+const FR_LAG_DEF: usize = env_u32(option_env!("XL_FRLAG_DEF"), 32) as usize;
+static FR_LAG: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+#[inline]
+fn fr_lag() -> usize {
+    *FR_LAG.get_or_init(|| std::env::var("XL_FRLAG").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(FR_LAG_DEF))
+}
+static FR_DONE: std::sync::OnceLock<Vec<std::sync::atomic::AtomicBool>> = std::sync::OnceLock::new();
+static FR_FRONT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[inline(never)]
+fn fr_done(g: &G, q: &[crate::Chunk], i: usize, k: usize) {
+    use std::sync::atomic::AtomicBool;
+    let d = FR_DONE.get_or_init(|| (0..q.len()).map(|_| AtomicBool::new(false)).collect());
+    d[i].store(true, Ordering::Release);
+    let lag = fr_lag();
+    if lag != 0 && i >= FR_FRONT.load(Ordering::Relaxed) + lag {
+        let c = q[i];
+        let fl = &g.files[c.file as usize];
+        fr_rel(g, fl.off + c.a, fl.off + c.b.min(fl.len));
+    }
+    loop {
+        let f = FR_FRONT.load(Ordering::Acquire);
+        let end = (f + k).min(q.len());
+        if f >= end || !(f..end).all(|j| d[j].load(Ordering::Acquire)) {
+            return;
+        }
+        if FR_FRONT.compare_exchange(f, end, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+            continue;
+        }
+        let (mut a0, mut b0) = (0usize, 0usize);
+        for j in f..end {
+            let c = q[j];
+            let fl = &g.files[c.file as usize];
+            let (a, b) = (fl.off + c.a, fl.off + c.b.min(fl.len));
+            if b0 != 0 && a >= b0 && a - b0 <= FR_GAP {
+                b0 = b;
+            } else {
+                fr_rel(g, a0, b0);
+                a0 = a;
+                b0 = b;
+            }
+        }
+        fr_rel(g, a0, b0);
+        if end == q.len() && std::env::var("XL_FRDBG").is_ok() {
+            eprintln!("[fr] released {} MB in {} calls, {} chunks, K {}", FR_BYTES.load(Ordering::Relaxed) >> 20, FR_CALLS.load(Ordering::Relaxed), q.len(), k);
+        }
+    }
+}
+fn fr_rel(g: &G, a: usize, b: usize) {
+    let a = (a + 4095) & !4095;
+    let b = b & !4095;
+    if b > a {
+        unsafe { madvise(g.region.add(a) as *mut u8, b - a, MADV_DONTNEED) };
+        FR_BYTES.fetch_add(b - a, Ordering::Relaxed);
+        FR_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+const FR_GAP: usize = 4 << 20;
+#[cfg(feature = "sp")]
+pub static SPTOUCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub static HOLD_FREE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static FR_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static FR_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);

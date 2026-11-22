@@ -222,6 +222,9 @@ pub fn name_of(g: &G, pkey: u64, out: &mut Vec<u8>) {
 
 #[derive(Default)]
 pub struct Scratch {
+    soff: Vec<u32>,
+    seg: (usize, usize),
+    whale: bool,
     tmp: Vec<[u64; 2]>,
     lk: Vec<u64>,
     l2: Vec<u32>,
@@ -409,6 +412,10 @@ fn fix_ties(g: &G, s: &mut [[u64; 2]]) {
     let n = s.len();
     let mut i = 1;
     while i < n {
+        i = next_tie(s, i);
+        if i >= n {
+            break;
+        }
         let x = s[i][0] ^ s[i - 1][0];
         if x >> 32 == 0 && x >> 4 != 0 {
             let ts = s[i][0] >> 32;
@@ -425,6 +432,41 @@ fn fix_ties(g: &G, s: &mut [[u64; 2]]) {
             i += 1;
         }
     }
+}
+
+#[inline(always)]
+fn next_tie(s: &[[u64; 2]], mut i: usize) -> usize {
+    let n = s.len();
+    const FIRST: [u8; 16] = [4, 0, 2, 0, 1, 0, 1, 0, 3, 0, 2, 0, 1, 0, 1, 0];
+    unsafe {
+        let p = s.as_ptr() as *const __m256i;
+        let hi = _mm256_set1_epi64x(0xFFFF_FFFF_0000_0000u64 as i64);
+        let lo = _mm256_set1_epi64x(0xFFFF_FFF0);
+        let m4 = |j: usize| -> u8 {
+            let pj = (p as *const [u64; 2]).add(j) as *const __m256i;
+            let pm = (p as *const [u64; 2]).add(j - 1) as *const __m256i;
+            let k = _mm256_unpacklo_epi64(_mm256_loadu_si256(pj), _mm256_loadu_si256(pj.add(1)));
+            let q = _mm256_unpacklo_epi64(_mm256_loadu_si256(pm), _mm256_loadu_si256(pm.add(1)));
+            let x = _mm256_xor_si256(k, q);
+            _mm256_mask_test_epi64_mask(_mm256_testn_epi64_mask(x, hi), x, lo)
+        };
+        while i + 8 <= n {
+            let a = m4(i);
+            let b = m4(i + 4);
+            if a | b != 0 {
+                return if a != 0 { i + FIRST[a as usize] as usize } else { i + 4 + FIRST[b as usize] as usize };
+            }
+            i += 8;
+        }
+        while i < n {
+            let x = s[i][0] ^ s[i - 1][0];
+            if x >> 32 == 0 && x >> 4 != 0 {
+                return i;
+            }
+            i += 1;
+        }
+    }
+    n
 }
 
 #[inline(always)]
@@ -559,7 +601,7 @@ unsafe fn sort_net<const R: usize>(g: &G, src: *const [u64; 2], s: &mut [[u64; 2
     let sq = src as *const u64;
     let maxv = z::set1_epi64(-1);
     let mut r = [maxv; R];
-    let mut pay = [maxv; R];
+    let mut rows = [[z::setzero(); 2]; R];
     let mut orall = z::setzero();
     let nb = (n + 7) / 8;
     if nb > R || R * 8 > 1 << (32 - IDX_SH) {
@@ -574,7 +616,7 @@ unsafe fn sort_net<const R: usize>(g: &G, src: *const [u64; 2], s: &mut [[u64; 2
         let kv = z::even_epi64(lo, hi);
         orall = z::or(orall, kv);
         r[b] = sort8(z::mask_or_epi64(maxv, km, kv, pos8(8 * b as i64)));
-        pay[b] = z::odd_epi64(lo, hi);
+        rows[b] = [lo, hi];
     }
     if z::test_epi64_mask(orall, z::set1_epi64(IDX_BITS as i64)) != 0 {
         return slow_from(g, src, s.as_mut_ptr(), n);
@@ -614,25 +656,30 @@ unsafe fn sort_net<const R: usize>(g: &G, src: *const [u64; 2], s: &mut [[u64; 2
         }
         k *= 2;
     }
-    let keys = r.as_ptr() as *const u64;
-    let pv = pay.as_ptr() as *const u64;
-    let mut prev = *keys & !IDX_BITS;
-    let mut tie = false;
-    for i in 0..n {
-        let k = *keys.add(i);
-        let kc = k & !IDX_BITS;
-        let x = kc ^ prev;
-        tie |= (x >> 32 == 0) & (x >> 4 != 0);
-        prev = kc;
-        *q.add(2 * i) = kc;
-        *q.add(2 * i + 1) = std::ptr::read_volatile(pv.add(((k >> IDX_SH) as usize) & (8 * R - 1)));
+    let idxb = z::set1_epi64(IDX_BITS as i64);
+    let mut tie = 0u8;
+    let mut pk = z::setzero();
+    for b in 0..nb {
+        let kc = z::andnot(idxb, r[b]);
+        let left = n - 8 * b;
+        let km: u8 = if left >= 8 { 0xFF } else { ((1u32 << left) - 1) as u8 };
+        let first: u8 = if b == 0 { 0xFE } else { 0xFF };
+        tie |= tie_mask(kc, z::prev_epi64(kc, pk)) & km & first;
+        pk = kc;
     }
-    if tie {
+    let keys = r.as_ptr() as *const u64;
+    let rp = rows.as_ptr() as *const __m128i;
+    let dst = q as *mut __m128i;
+    for i in 0..n {
+        let j = ((*keys.add(i) >> IDX_SH) as usize) & (8 * R - 1);
+        _mm_storeu_si128(dst.add(i), std::ptr::read_volatile(rp.add(j)));
+    }
+    if tie != 0 {
         fix_ties(g, s);
     }
 }
 
-unsafe fn sort_users(g: &G, off: *const u32, ua: usize, ub: usize, sc: &mut Scratch) {
+unsafe fn sort_users(g: &G, off: *const u32, base: *mut [u64; 2], ua: usize, ub: usize, sc: &mut Scratch) {
     let cap = ub - ua + 16;
     for l in [&mut sc.l2, &mut sc.l8, &mut sc.l16, &mut sc.lbig] {
         l.clear();
@@ -658,7 +705,7 @@ unsafe fn sort_users(g: &G, off: *const u32, ua: usize, ub: usize, sc: &mut Scra
     }
     let row = |u: u32| -> (*mut [u64; 2], usize) {
         let a = *off.add(u as usize) as usize;
-        (g.csr.add(a), *off.add(u as usize + 1) as usize - a)
+        (base.add(a), *off.add(u as usize + 1) as usize - a)
     };
     for i in 0..n2 {
         let p = row(*l2.add(i)).0;
@@ -725,7 +772,11 @@ fn tie_group(g: &G, s: &mut [[u64; 2]], i: usize) -> usize {
         }
     } else {
         if DEFER_RAW.load(Ordering::Relaxed) {
-            DEFERRED.lock().unwrap().push((grp.as_mut_ptr() as usize, grp.len()));
+            if MODE8.load(Ordering::Relaxed) {
+                TL_DEF.with(|d| d.borrow_mut().push((grp.as_mut_ptr() as usize, grp.len())));
+            } else {
+                DEFERRED.lock().unwrap().push((grp.as_mut_ptr() as usize, grp.len()));
+            }
             return b;
         }
         grp.sort_by(|x, y| crate::events::cid_cmp(g, y[1], x[1]).then_with(|| x[0].cmp(&y[0])));
@@ -735,11 +786,136 @@ fn tie_group(g: &G, s: &mut [[u64; 2]], i: usize) -> usize {
 static DEFER_RAW: AtomicBool = AtomicBool::new(false);
 static DEFERRED: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
 
+static C8_NEXT: AtomicUsize = AtomicUsize::new(0);
+static C8_BASE: AtomicUsize = AtomicUsize::new(0);
+static C8_CAP: AtomicUsize = AtomicUsize::new(0);
+static C8_SEG: AtomicUsize = AtomicUsize::new(0);
+const C8_PAGE: usize = (2 << 20) / 8;
+static MODE8: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    static TL_DEF: std::cell::RefCell<Vec<(usize, usize)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+static DEFERRED8: std::sync::Mutex<Vec<(usize, bool, Vec<[u64; 2]>)>> = std::sync::Mutex::new(Vec::new());
+
+#[inline]
+fn c8_take(n: usize) -> usize {
+    let n = (n + C8_PAGE - 1) & !(C8_PAGE - 1);
+    let at = C8_NEXT.fetch_add(n, Ordering::Relaxed);
+    if at + n + 64 > C8_CAP.load(Ordering::Relaxed) {
+        fallback("CSR capacity");
+    }
+    at
+}
+#[inline]
+fn c8_seg(sc: &mut Scratch, need: usize) -> usize {
+    if sc.seg.1 < sc.seg.0 + need {
+        let sz = need.max(C8_SEG.load(Ordering::Relaxed));
+        let at = c8_take(sz);
+        sc.seg = (at, at + sz);
+    }
+    sc.seg.0
+}
+
+#[inline(always)]
+unsafe fn keys_out(src: *const [u64; 2], dst: *mut u64, n: usize) {
+    let mut i = 0usize;
+    while i + 4 <= n {
+        let a = _mm256_loadu_si256(src.add(i) as *const __m256i);
+        let b = _mm256_loadu_si256(src.add(i + 2) as *const __m256i);
+        _mm256_storeu_si256(dst.add(i) as *mut __m256i, _mm256_permute4x64_epi64::<0xD8>(_mm256_unpacklo_epi64(a, b)));
+        i += 4;
+    }
+    while i < n {
+        *dst.add(i) = (*src.add(i))[0];
+        i += 1;
+    }
+}
+
+unsafe fn rows_out(cxl: &[u32], soff: *const u32, off8: *const u32, src: *const [u64; 2], ua: usize, ub: usize) {
+    let csr8 = C8_BASE.load(Ordering::Relaxed) as *mut u64;
+    let mut s = *soff.add(ua) as usize;
+    let mut d = *off8.add(ua) as usize;
+    for &ul in cxl {
+        let ul = ul as usize;
+        let (a, b) = (*soff.add(ul) as usize, *soff.add(ul + 1) as usize);
+        if *off8.add(ul) as usize != d + (a - s) || *off8.add(ul + 1) as usize != *off8.add(ul) as usize + 2 * (b - a) {
+            fallback("CSR words");
+        }
+        keys_out(src.add(s), csr8.add(d), a - s);
+        std::ptr::copy(src.add(a) as *const u64, csr8.add(*off8.add(ul) as usize), 2 * (b - a));
+        s = b;
+        d = *off8.add(ul + 1) as usize;
+    }
+    let e = *soff.add(ub) as usize;
+    if *off8.add(ub) as usize != d + (e - s) {
+        fallback("CSR words");
+    }
+    keys_out(src.add(s), csr8.add(d), e - s);
+}
+
+unsafe fn defer8(utab: &[u16], soff: *const u32, off8: *const u32, src: *const [u64; 2]) {
+    TL_DEF.with(|d| {
+        let mut d = d.borrow_mut();
+        if d.is_empty() {
+            return;
+        }
+        let so = std::slice::from_raw_parts(soff, UBSIZE + 1);
+        let mut out = DEFERRED8.lock().unwrap();
+        for &(p, n) in d.iter() {
+            let s = (p - src as usize) / 16;
+            let ul = so.partition_point(|&x| x as usize <= s) - 1;
+            if s + n > so[ul + 1] as usize {
+                fallback("deferred tie group");
+            }
+            let two = utab[ul] & COMPLEX != 0;
+            let at = *off8.add(ul) as usize + (s - so[ul] as usize) * (1 + two as usize);
+            out.push((at, two, std::slice::from_raw_parts(p as *const [u64; 2], n).to_vec()));
+        }
+        d.clear();
+    });
+}
+
+fn convert16(g: &mut G) {
+    let words: usize = 2 * g.ncsr + 64;
+    let dst = crate::sys::anon(words * 8) as *mut u64;
+    let mut at = 0usize;
+    for ub in 0..g.nub {
+        let utab = utab_of(g, ub);
+        let off = off_of(g, ub);
+        let mut prev = off[0] as usize;
+        for ul in 0..UBSIZE {
+            let (a, b) = (prev, off[ul + 1] as usize);
+            prev = b;
+            off[ul] = at as u32;
+            let two = utab[ul] & COMPLEX != 0;
+            for i in a..b {
+                let r = unsafe { *g.csr.add(i) };
+                unsafe { *dst.add(at) = r[0] };
+                at += 1;
+                if two {
+                    unsafe { *dst.add(at) = r[1] };
+                    at += 1;
+                }
+            }
+        }
+        off[UBSIZE] = at as u32;
+    }
+    if at + 16 > words || at >= u32::MAX as usize {
+        fallback("CSR capacity");
+    }
+    g.csr = dst as *mut [u64; 2];
+    g.csr_cap = words / 2;
+    g.ncsr = at + 16;
+}
+
 struct Heavy {
     ub: usize,
     cnt: Vec<UnsafeCell<Vec<u32>>>,
     links: Vec<UnsafeCell<Vec<u64>>>,
     cx: UnsafeCell<Vec<(u32, u8, u8)>>,
+    scr: UnsafeCell<Vec<[u64; 2]>>,
+    soff: UnsafeCell<Vec<u32>>,
+    cxl: UnsafeCell<Vec<u32>>,
     counted: AtomicUsize,
     links_taken: AtomicBool,
     links_fin: AtomicBool,
@@ -756,6 +932,9 @@ pub static DBG: AtomicBool = AtomicBool::new(false);
 struct Plan {
     heavy: Vec<Heavy>,
     normal: Vec<u32>,
+    whale: usize,
+    nres: usize,
+    rnext: AtomicUsize,
     base: Vec<usize>,
     next: AtomicUsize,
     fin: AtomicUsize,
@@ -802,11 +981,27 @@ fn links_done(t: &mut TState, utab: &mut [u16], u0: usize) -> bool {
             }
         }
     }
+    const _: () = assert!(UBSIZE % 32 == 0);
     let mut anyc = false;
-    for (ul, &v) in utab.iter().enumerate() {
-        if v & COMPLEX != 0 {
-            t.cx_users.push((u0 + ul) as u32);
-            anyc = true;
+    if utab.len() != UBSIZE {
+        fallback("user table");
+    }
+    unsafe {
+        let p = utab.as_ptr();
+        let cm = _mm256_set1_epi16(COMPLEX as i16);
+        let mut ul = 0usize;
+        while ul < UBSIZE {
+            let a = _mm256_test_epi16_mask(_mm256_loadu_si256(p.add(ul) as *const __m256i), cm) as u32;
+            let b = _mm256_test_epi16_mask(_mm256_loadu_si256(p.add(ul + 16) as *const __m256i), cm) as u32;
+            let mut m = a | b << 16;
+            if m != 0 {
+                anyc = true;
+                while m != 0 {
+                    t.cx_users.push((u0 + ul + m.trailing_zeros() as usize) as u32);
+                    m &= m - 1;
+                }
+            }
+            ul += 32;
         }
     }
     anyc
@@ -863,6 +1058,9 @@ unsafe fn scatter_chunk(recs: &[Rec], pos: *mut u32, csr: *mut [u64; 2]) {
 
 fn bucket(g: &G, t: &mut TState, sc: &mut Scratch, ub: usize) {
     let tstart = std::time::Instant::now();
+    if ub == unsafe { PLAN.as_ref().unwrap_unchecked() }.whale {
+        sc.whale = true;
+    }
     let u0 = ub << UB;
     let utab = utab_of(g, ub);
     let total = pbase(ub + 1) - pbase(ub);
@@ -892,6 +1090,7 @@ fn bucket(g: &G, t: &mut TState, sc: &mut Scratch, ub: usize) {
     }
     let dbg1 = tstart.elapsed().as_nanos() as u64;
     t.prof[5] += dbg1;
+    let cx0 = t.cx_users.len();
     if links_done(t, utab, u0) {
         for &w0 in lks {
             let ul = ((w0 >> 43) & (UBSIZE as u64 - 1)) as usize;
@@ -901,24 +1100,50 @@ fn bucket(g: &G, t: &mut TState, sc: &mut Scratch, ub: usize) {
         }
     }
     if total != 0 {
-        let off = off_of(g, ub);
-        let mut at = pbase(ub) as u32;
+        let cxl: Vec<u32> = t.cx_users[cx0..].iter().map(|&u| u - u0 as u32).collect();
+        let mut soff = std::mem::take(&mut sc.soff);
+        soff.clear();
+        soff.resize(UBSIZE + 1, 0);
+        let mut at = 0u32;
         for ul in 0..UBSIZE {
-            off[ul] = at;
+            soff[ul] = at;
             at += cnt[ul];
-            cnt[ul] = off[ul];
+            cnt[ul] = soff[ul];
         }
-        off[UBSIZE] = at;
-        if at as usize - pbase(ub) + nl != total {
+        soff[UBSIZE] = at;
+        let nck = at as usize;
+        if nck + nl != total {
             fallback("click partition count");
         }
+        let ncx: usize = cxl.iter().map(|&ul| (soff[ul as usize + 1] - soff[ul as usize]) as usize).sum();
+        let off = off_of(g, ub);
+        let base8 = c8_seg(sc, 2 * (nck + 1 + 32));
+        {
+            let mut d = base8 as u32;
+            let mut k = 0usize;
+            for ul in 0..UBSIZE {
+                off[ul] = d;
+                let n = soff[ul + 1] - soff[ul];
+                let two = k < cxl.len() && cxl[k] as usize == ul;
+                k += two as usize;
+                d += n << two as u32;
+            }
+            off[UBSIZE] = d;
+        }
         cnt[UBSIZE..].fill(at);
+        let rp = (C8_BASE.load(Ordering::Relaxed) as *mut u64).wrapping_add(base8) as *mut [u64; 2];
         for th in 0..g.nt {
-            g.t(th).us.for_each(ub, |recs| unsafe { scatter_chunk(recs, cp, g.csr) });
+            g.t(th).us.for_each(ub, |recs| unsafe { scatter_chunk(recs, cp, rp) });
         }
         let dbg2 = tstart.elapsed().as_nanos() as u64;
         t.prof[6] += dbg2;
-        unsafe { sort_users(g, off.as_ptr(), 0, UBSIZE, sc) };
+        unsafe {
+            sort_users(g, soff.as_ptr(), rp, 0, UBSIZE, sc);
+            defer8(utab, soff.as_ptr(), off.as_ptr(), rp);
+            rows_out(&cxl, soff.as_ptr(), off.as_ptr(), rp, 0, UBSIZE);
+        }
+        sc.seg.0 = base8 + ((nck + ncx + 1) & !1);
+        sc.soff = soff;
     } else {
         t.prof[6] += dbg1;
     }
@@ -960,6 +1185,7 @@ fn heavy_links(g: &G, t: &mut TState, h: &Heavy) {
             link_rec(t, utab, w0);
         }
     }
+    let cx0 = t.cx_users.len();
     if links_done(t, utab, u0) {
         let cx = unsafe { &mut *h.cx.get() };
         for th in 0..g.nt {
@@ -971,22 +1197,39 @@ fn heavy_links(g: &G, t: &mut TState, h: &Heavy) {
             }
         }
     }
-    let off = off_of(g, ub);
-    let mut at = pbase(ub) as u32;
+    let cxl = unsafe { &mut *h.cxl.get() };
+    cxl.clear();
+    cxl.extend(t.cx_users[cx0..].iter().map(|&u| u - u0 as u32));
+    let soff = unsafe { &mut *h.soff.get() };
+    soff.clear();
+    soff.resize(UBSIZE + 1, 0);
+    let mut at = 0u32;
     for ul in 0..UBSIZE {
-        off[ul] = at;
+        soff[ul] = at;
         for th in 0..g.nt {
             at += unsafe { &*h.cnt[th].get() }[ul];
         }
     }
-    off[UBSIZE] = at;
+    soff[UBSIZE] = at;
+    let ncx: usize = cxl.iter().map(|&ul| (soff[ul as usize + 1] - soff[ul as usize]) as usize).sum();
+    let off = off_of(g, ub);
+    let mut d = c8_take(at as usize + ncx) as u32;
+    let mut k = 0usize;
+    for ul in 0..UBSIZE {
+        off[ul] = d;
+        let n = soff[ul + 1] - soff[ul];
+        let two = k < cxl.len() && cxl[k] as usize == ul;
+        k += two as usize;
+        d += n << two as u32;
+    }
+    off[UBSIZE] = d;
 }
 
 fn heavy_scatter(g: &G, t: &mut TState, h: &Heavy, th: usize) {
     let mut pos = std::mem::take(&mut t.cnt);
     pos.clear();
     pos.resize(2 * UBSIZE, 0);
-    let mut at = pbase(h.ub) as u32;
+    let mut at = 0u32;
     for ul in 0..UBSIZE {
         for t2 in 0..g.nt {
             if t2 == th {
@@ -1005,12 +1248,13 @@ fn heavy_scatter(g: &G, t: &mut TState, h: &Heavy, th: usize) {
         links += n;
     }
     let total = pbase(h.ub + 1) - pbase(h.ub);
-    if at as usize - pbase(h.ub) + links != total {
+    if at as usize + links != total || unsafe { &*h.scr.get() }.capacity() < total {
         fallback("click partition count");
     }
     pos[UBSIZE..].fill(spare as u32);
     let pp = pos.as_mut_ptr();
-    g.t(th).us.for_each(h.ub, |recs| unsafe { scatter_chunk(recs, pp, g.csr) });
+    let rp = unsafe { (*h.scr.get()).as_mut_ptr() };
+    g.t(th).us.for_each(h.ub, |recs| unsafe { scatter_chunk(recs, pp, rp) });
     t.cnt = pos;
 }
 
@@ -1038,7 +1282,17 @@ fn heavy_step(g: &G, p: &Plan, t: &mut TState, sc: &mut Scratch) -> bool {
             let j = h.sort_next.fetch_add(1, SeqCst);
             if j < SORT_UNITS {
                 let (a, b) = if j < 64 { (j, j + 1) } else { ((j - 63) * 64, (j - 62) * 64) };
-                unsafe { sort_users(g, off_of(g, h.ub).as_ptr(), a, b, sc) };
+                unsafe {
+                    let soff = (*h.soff.get()).as_ptr();
+                    let off8 = off_of(g, h.ub).as_ptr();
+                    let rp = (*h.scr.get()).as_mut_ptr();
+                    sort_users(g, soff, rp, a, b, sc);
+                    let cxl = &*h.cxl.get();
+                    let lo = cxl.partition_point(|&x| (x as usize) < a);
+                    let hi = cxl.partition_point(|&x| (x as usize) < b);
+                    defer8(utab_of(g, h.ub), soff, off8, rp);
+                    rows_out(&cxl[lo..hi], soff, off8, rp, a, b);
+                }
                 h.sort_fin.fetch_add(1, SeqCst);
                 return true;
             }
@@ -1332,7 +1586,7 @@ fn bucket_ix(g: &G, p: &PlanX, t: &mut TState, sc: &mut Scratch, ub: usize) {
         }
         fill_off(off, lo, hi);
         d2 = tstart.elapsed().as_nanos() as u64;
-        unsafe { sort_users(g, off.as_ptr(), 0, UBSIZE, sc) };
+        unsafe { sort_users(g, off.as_ptr(), g.csr, 0, UBSIZE, sc) };
     }
     let el = tstart.elapsed().as_nanos() as u64;
     t.prof[5] += d1;
@@ -1373,7 +1627,7 @@ fn heavy_step_ix(g: &G, p: &PlanX, t: &mut TState, sc: &mut Scratch) -> bool {
             let j = h.sort_next.fetch_add(1, SeqCst);
             if j < SORT_UNITS {
                 let (a, b) = if j < 64 { (j, j + 1) } else { ((j - 63) * 64, (j - 62) * 64) };
-                unsafe { sort_users(g, off_of(g, h.ub).as_ptr(), a, b, sc) };
+                unsafe { sort_users(g, off_of(g, h.ub).as_ptr(), g.csr, a, b, sc) };
                 h.sort_fin.fetch_add(1, SeqCst);
                 t.prof[3] += tstart.elapsed().as_nanos() as u64;
                 return true;
@@ -1652,7 +1906,7 @@ fn bucket_a(g: &G, p: &PlanA, t: &mut TState, sc: &mut Scratch, ub: usize) {
         }
         fill_off(off, lo, hi);
         d2 = tstart.elapsed().as_nanos() as u64;
-        unsafe { sort_users(g, off.as_ptr(), 0, UBSIZE, sc) };
+        unsafe { sort_users(g, off.as_ptr(), g.csr, 0, UBSIZE, sc) };
     }
     unsafe { *p.range[ub].get() = (lo, hi) };
     let el = tstart.elapsed().as_nanos() as u64;
@@ -1759,7 +2013,7 @@ fn heavy_step_a(g: &G, p: &PlanA, t: &mut TState, sc: &mut Scratch) -> bool {
             let j = h.sort_next.fetch_add(1, SeqCst);
             if j < SORT_UNITS {
                 let (a, b) = if j < 64 { (j, j + 1) } else { ((j - 63) * 64, (j - 62) * 64) };
-                unsafe { sort_users(g, off_of(g, h.ub).as_ptr(), a, b, sc) };
+                unsafe { sort_users(g, off_of(g, h.ub).as_ptr(), g.csr, a, b, sc) };
                 h.sort_fin.fetch_add(1, SeqCst);
                 return true;
             }
@@ -1854,6 +2108,27 @@ pub fn stage2(g: &mut G) {
         let grp = unsafe { std::slice::from_raw_parts_mut(p as *mut [u64; 2], n) };
         grp.sort_by(|x, y| crate::events::cid_cmp(g, y[1], x[1]).then_with(|| x[0].cmp(&y[0])));
     }
+    if MODE8.load(Ordering::SeqCst) {
+        g.csr = C8_BASE.load(Ordering::SeqCst) as *mut [u64; 2];
+    }
+    let d8 = std::mem::take(&mut *DEFERRED8.lock().unwrap());
+    if DBG.load(Ordering::Relaxed) {
+        eprintln!("[dbg] C8 deferred tie groups {}, two-word {}", d8.len(), d8.iter().filter(|x| x.1).count());
+    }
+    for (at, two, mut grp) in d8 {
+        grp.sort_by(|x, y| crate::events::cid_cmp(g, y[1], x[1]).then_with(|| x[0].cmp(&y[0])));
+        let c8 = g.csr as *mut u64;
+        for (k, r) in grp.iter().enumerate() {
+            unsafe {
+                if two {
+                    *c8.add(at + 2 * k) = r[0];
+                    *c8.add(at + 2 * k + 1) = r[1];
+                } else {
+                    *c8.add(at + k) = r[0];
+                }
+            }
+        }
+    }
     let cx;
     if g.ccap != 0 && g.cpart {
         let mut p = unsafe { PLANA.take().unwrap() };
@@ -1876,6 +2151,7 @@ pub fn stage2(g: &mut G) {
         g.ncsr = end;
         g.csr_base = base;
         cx = p.heavy.iter_mut().map(|h| std::mem::take(h.cx.get_mut())).collect();
+        convert16(g);
     } else if g.ccap != 0 {
         let mut p = unsafe { PLANX.take().unwrap() };
         for f in &p.fixes {
@@ -1884,9 +2160,20 @@ pub fn stage2(g: &mut G) {
         g.ncsr = p.bounds[g.nub];
         g.csr_base = std::mem::take(&mut p.bounds);
         cx = p.heavy.iter_mut().map(|h| std::mem::take(h.cx.get_mut())).collect();
+        convert16(g);
     } else {
         let mut p = unsafe { PLAN.take().unwrap() };
-        g.ncsr = p.base[g.nub];
+        g.ncsr = C8_NEXT.load(Ordering::SeqCst) + 64;
+        if DBG.load(Ordering::Relaxed) {
+            extern "C" {
+                fn mincore(a: *mut u8, len: usize, vec: *mut u8) -> i32;
+            }
+            let len = (g.ncsr * 8 + 4095) & !4095;
+            let mut v = vec![0u8; len / 4096];
+            let r = unsafe { mincore(g.csr as *mut u8, len, v.as_mut_ptr()) };
+            let res = v.iter().filter(|&&x| x & 1 != 0).count();
+            eprintln!("[dbg] C8: {} words of segments, mincore {} resident {} kB", g.ncsr, r, res * 4);
+        }
         g.csr_base = std::mem::take(&mut p.base);
         cx = p.heavy.iter_mut().map(|h| std::mem::take(h.cx.get_mut())).collect();
     }
@@ -1898,6 +2185,8 @@ pub fn stage2(g: &mut G) {
 fn prelude(g: &G, inq: bool) {
     DBG.store(std::env::var("XL_DBG").is_ok(), Ordering::Relaxed);
     DEFER_RAW.store(inq, Ordering::SeqCst);
+    MODE8.store(g.ccap == 0, Ordering::SeqCst);
+    C8_NEXT.store(0, Ordering::SeqCst);
     if g.ccap == 0 {
         prelude_part(g);
     } else if g.cpart {
@@ -2013,9 +2302,17 @@ fn prelude_part(g: &G) {
     if at + 16 > g.csr_cap {
         fallback("CSR capacity");
     }
+    let seg = (2 * at / g.nt).max(1 << 20);
+    let cap = 8 * at + (4 * g.nt + 8) * (seg + C8_PAGE) + 4096;
+    if cap >= u32::MAX as usize {
+        fallback("CSR capacity");
+    }
+    C8_BASE.store(crate::sys::anon(cap * 8) as usize, Ordering::SeqCst);
+    C8_CAP.store(cap, Ordering::SeqCst);
+    C8_SEG.store(seg, Ordering::SeqCst);
     let total = at;
     let nt = g.nt;
-    let mut plan = Plan { heavy: Vec::new(), normal: Vec::new(), base, next: AtomicUsize::new(0), fin: AtomicUsize::new(0) };
+    let mut plan = Plan { heavy: Vec::new(), normal: Vec::new(), whale: usize::MAX, nres: 0, rnext: AtomicUsize::new(0), base, next: AtomicUsize::new(0), fin: AtomicUsize::new(0) };
     for ub in 0..g.nub {
         let n = plan.base[ub + 1] - plan.base[ub];
         if n > (total / HEAVY_DIV).max(1 << 17) {
@@ -2024,6 +2321,9 @@ fn prelude_part(g: &G) {
                 cnt: (0..nt).map(|_| z::nv(UnsafeCell::new(Vec::new()))).collect(),
                 links: (0..nt).map(|_| z::nv(UnsafeCell::new(Vec::new()))).collect(),
                 cx: UnsafeCell::new(Vec::new()),
+                scr: UnsafeCell::new(Vec::with_capacity(n + 32)),
+                soff: UnsafeCell::new(Vec::new()),
+                cxl: UnsafeCell::new(Vec::new()),
                 counted: AtomicUsize::new(0),
                 links_taken: AtomicBool::new(false),
                 links_fin: AtomicBool::new(false),
@@ -2036,8 +2336,32 @@ fn prelude_part(g: &G) {
             plan.normal.push(ub as u32);
         }
     }
+    if let Some((k, &wb)) = plan.normal.iter().enumerate().max_by_key(|&(_, &ub)| plan.base[ub as usize + 1] - plan.base[ub as usize]) {
+        let nw = plan.base[wb as usize + 1] - plan.base[wb as usize];
+        let on = !std::env::var("XL_C8RES").is_ok_and(|v| v == "0");
+        if on && plan.normal.len() > 8 && nw >= 1 << 16 && nw > 8 * total / plan.normal.len() {
+            plan.normal.remove(k);
+            plan.normal.insert(0, wb);
+            plan.whale = wb as usize;
+            let room = nw - nw / 8;
+            let mut big = 0usize;
+            let mut sum = 0usize;
+            let mut r = 0usize;
+            while r + 1 < plan.normal.len() {
+                let ub = plan.normal[plan.normal.len() - 1 - r] as usize;
+                let n = plan.base[ub + 1] - plan.base[ub];
+                if sum + n + 2 * big.max(n) + 256 > room {
+                    break;
+                }
+                sum += n;
+                big = big.max(n);
+                r += 1;
+            }
+            plan.nres = r;
+        }
+    }
     if DBG.load(Ordering::Relaxed) {
-        eprintln!("[dbg] heavy buckets {:?} total {total}", plan.heavy.iter().map(|h| (h.ub, plan.base[h.ub + 1] - plan.base[h.ub])).collect::<Vec<_>>());
+        eprintln!("[dbg] heavy buckets {:?} total {total}, whale {} kept {}", plan.heavy.iter().map(|h| (h.ub, plan.base[h.ub + 1] - plan.base[h.ub])).collect::<Vec<_>>(), plan.whale as isize, plan.nres);
     }
     unsafe { PLAN = Some(plan) };
     READY.store(true, Ordering::SeqCst);
@@ -2050,7 +2374,15 @@ fn job_part(g: &G, t: &mut TState, sc: &mut Scratch) -> bool {
     }
     let nt = g.nt;
     let nh = p.heavy.len();
-    let nq = nh * nt + p.normal.len();
+    let nq = nh * nt + p.normal.len() - p.nres;
+    if sc.whale && p.rnext.load(Ordering::Relaxed) < p.nres {
+        let r = p.rnext.fetch_add(1, Ordering::Relaxed);
+        if r < p.nres {
+            bucket(g, t, sc, p.normal[p.normal.len() - 1 - r] as usize);
+            p.fin.fetch_add(1, Ordering::SeqCst);
+            return true;
+        }
+    }
     if p.next.load(Ordering::Relaxed) >= nq {
         return false;
     }
